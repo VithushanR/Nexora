@@ -62,7 +62,7 @@ Full task-by-task breakdown, edge-case handling, and the LangGraph implementatio
 | Embeddings | Sentence Transformers |
 | Vector search | FAISS |
 | Storage | SQLite |
-| Frontend | Streamlit |
+| Frontend | React (Vite + TypeScript) |
 
 ## Data Sources
 
@@ -88,6 +88,7 @@ Retrieval draws from free academic and gray-literature APIs — [OpenAlex](https
 
 ### Prerequisites
 - Python 3.11+
+- Node.js 18+
 - A Gemini API key (free tier — [ai.google.dev](https://ai.google.dev/))
 
 ### Installation
@@ -95,23 +96,35 @@ Retrieval draws from free academic and gray-literature APIs — [OpenAlex](https
 ```bash
 git clone https://github.com/<your-username>/<your-repo>.git
 cd <your-repo>
+
+# backend
 pip install -r requirements.txt --break-system-packages
+
+# frontend
+cd frontend
+npm install
 ```
 
 ### Configuration
 
-Create a `.env` file in the project root:
+Create a `.env` file in the project root (backend):
 
 ```env
 GEMINI_API_KEY=your_key_here
 OPENALEX_MAILTO=you@example.com
 ```
 
+Create a `.env` file in `frontend/`:
+
+```env
+VITE_API_BASE_URL=http://localhost:8000
+```
+
 ### Running locally
 
 ```bash
-uvicorn app.main:app --reload   # backend
-streamlit run frontend/app.py   # frontend, separate terminal
+uvicorn app.main:app --reload    # backend
+cd frontend && npm run dev       # frontend, separate terminal
 ```
 
 ## Responsible AI
