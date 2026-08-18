@@ -1,0 +1,6 @@
+/* Global styles: Tailwind directives + any app-wide base styles. */
+/* TODO: add design tokens / custom base styles once visual design is decided. */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

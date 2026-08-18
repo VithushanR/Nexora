@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+langgraph
+langchain-google-genai
+httpx
+tenacity
+aiolimiter
+sentence-transformers
+faiss-cpu
+rapidfuzz
+rank-bm25
+scikit-learn
+pydantic
+pydantic-settings
+python-dotenv
