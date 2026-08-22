@@ -12,7 +12,7 @@ Responsibility:
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from state import ResearchState
+from Nexora.backend.graph.state import ResearchState
 from agents import protocol_planning, retrieval_screening, synthesis_integrity, gap_discovery
 from report import assembly
 

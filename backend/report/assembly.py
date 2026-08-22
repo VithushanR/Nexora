@@ -11,7 +11,7 @@ Responsibility:
 import faiss
 from sentence_transformers import SentenceTransformer
 
-from state import ResearchState
+from Nexora.backend.graph.state import ResearchState
 
 
 async def assemble_report(state: ResearchState) -> ResearchState:
