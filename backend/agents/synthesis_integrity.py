@@ -10,7 +10,7 @@ Responsibility:
 """
 
 from llm.client import get_llm_client
-from state import ResearchState
+from Nexora.backend.graph.state import ResearchState
 
 
 async def synthesis_integrity(state: ResearchState) -> ResearchState:
