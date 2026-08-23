@@ -1,0 +1,22 @@
+[
+  {
+    "title": "CNN leaf disease classifier",
+    "full_text": "1. Introduction\nWe train a CNN on leaf images.\n\n5. Limitations\nOur dataset was collected under controlled laboratory lighting and the model was not tested outside those conditions. The sample was limited to a single geographic region.\n\n6. Conclusion\nResults are promising."
+  },
+  {
+    "title": "Vision transformers for crop disease",
+    "full_text": "1. Introduction\nWe evaluate ViT architectures.\n\n4. Future Work\nThe model has not been validated under variable field lighting conditions, which limits real-world deployment. Future work should collect images across multiple sites.\n\n5. Conclusion\nViT performs competitively."
+  },
+  {
+    "title": "Field trial of disease detection",
+    "full_text": "1. Introduction\nA field trial across three farms.\n\n6. Limitations\nEvaluation was performed only in controlled lighting environments and was never tested under changing outdoor illumination. We also note the small number of participating farms.\n\n7. Conclusion\nField results differ from lab results."
+  },
+  {
+    "title": "Hyperspectral imaging survey",
+    "full_text": "1. Introduction\nA survey of hyperspectral approaches.\n\n3. Limitations\nThe cost of hyperspectral sensors remains prohibitive for smallholder farmers in low-income regions.\n\n4. Conclusion\nHyperspectral methods are accurate but expensive."
+  },
+  {
+    "title": "Edge deployment of disease models",
+    "full_text": null
+  }
+]
