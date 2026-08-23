@@ -2,14 +2,21 @@ fastapi
 uvicorn[standard]
 langgraph
 langchain-google-genai
+google-genai
 httpx
 tenacity
 aiolimiter
 sentence-transformers
 faiss-cpu
+numpy
+pypdf
 rapidfuzz
 rank-bm25
 scikit-learn
 pydantic
 pydantic-settings
 python-dotenv
+
+# --- dev / test ---
+pytest
+pytest-asyncio
