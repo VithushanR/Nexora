@@ -13,3 +13,4 @@ scikit-learn
 pydantic
 pydantic-settings
 python-dotenv
+reportlab
