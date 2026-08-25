@@ -97,3 +97,36 @@ async def get_text(client: httpx.AsyncClient, source: str, url: str, **kwargs) -
         return await _do()
     except Exception as e:
         raise SourceUnavailableError(f"{source}: {type(e).__name__}: {e}") from e
+
+async def get_bytes(client: httpx.AsyncClient, source: str, url: str, *,
+                    timeout: httpx.Timeout | None = None, max_bytes: int | None = None,
+                    **kwargs) -> bytes:
+    """Rate-limited, retrying GET returning raw bytes -- used by Agent 3's
+    full-text cascade to pull OA PDFs. Redirects are followed because most
+    OA landing pages bounce through one or two hops before the real file.
+
+    `max_bytes` guards against a mis-linked "PDF" that is actually a huge
+    file: we stream and abort once the cap is passed, rather than pulling
+    an unbounded download into memory.
+    """
+    limiter = RATE_LIMITS.get(source, AsyncLimiter(2, 1))
+
+    @retryable()
+    async def _do():
+        async with limiter:
+            async with client.stream("GET", url, headers=DEFAULT_HEADERS,
+                                     timeout=timeout or DEFAULT_TIMEOUT,
+                                     follow_redirects=True, **kwargs) as r:
+                r.raise_for_status()
+                chunks, total = [], 0
+                async for chunk in r.aiter_bytes():
+                    total += len(chunk)
+                    if max_bytes is not None and total > max_bytes:
+                        raise ValueError(f"response exceeded max_bytes ({max_bytes})")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+
+    try:
+        return await _do()
+    except Exception as e:
+        raise SourceUnavailableError(f"{source}: {type(e).__name__}: {e}") from e
