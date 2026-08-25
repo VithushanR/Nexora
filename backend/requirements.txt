@@ -16,6 +16,7 @@ scikit-learn
 pydantic
 pydantic-settings
 python-dotenv
+reportlab
 
 # --- dev / test ---
 pytest

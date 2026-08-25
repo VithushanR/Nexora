@@ -14,20 +14,17 @@ Topology (per the project doc):
                                                                 |
                                                         report_assembly -> END
 
-CURRENT STATE: only Agent 2 (retrieval_screening) is wired in. Everything
-else is a TODO block below, in topology order -- uncomment as each node
-lands. Owners: fill in your section, remove your TODO once your node is
-real and tested.
+CURRENT STATE: Agent 1 (protocol_planning) and Agent 2
+(retrieval_screening) are wired in. Everything after retrieval is a TODO
+block below, in topology order -- uncomment as each node lands.
 """
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from backend.graph.state import ResearchState
+from backend.agents.protocol_planning import protocol_planning_node
 from backend.agents.retrieval_screening import retrieval_screening_node
-
-# TODO(agent-1-owner): implement backend/agents/protocol_planning.py, then:
-# from backend.agents.protocol_planning import protocol_planning_node
 
 # TODO(human-checkpoint-owner): implement the interrupt()-based selection
 # node. Requires the checkpointer already wired in below (MemorySaver for
@@ -53,17 +50,13 @@ from backend.agents.retrieval_screening import retrieval_screening_node
 def build_graph() -> StateGraph:
     graph = StateGraph(ResearchState)
 
-    # --- Agent 2 (this PR) ---
+    # Agent 1 must create a validated protocol before Agent 2 can retrieve
+    # papers, because Agent 2 reads protocol criteria and per-source queries.
+    graph.add_node("protocol_planning", protocol_planning_node)
     graph.add_node("retrieval_screening", retrieval_screening_node)
-    graph.add_edge(START, "retrieval_screening")
+    graph.add_edge(START, "protocol_planning")
+    graph.add_edge("protocol_planning", "retrieval_screening")
     graph.add_edge("retrieval_screening", END)  # TODO: remove once human_selection exists
-
-    # TODO(agent-1-owner): uncomment, then REMOVE the two START/END lines
-    # above (retrieval_screening becomes the second node, not the entry).
-    #
-    # graph.add_node("protocol_planning", protocol_planning_node)
-    # graph.add_edge(START, "protocol_planning")
-    # graph.add_edge("protocol_planning", "retrieval_screening")
 
     # TODO(human-checkpoint-owner): uncomment, then REMOVE the
     # "retrieval_screening" -> END edge above.
