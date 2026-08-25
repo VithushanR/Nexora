@@ -456,3 +456,102 @@ async def test_node_writes_only_the_three_fields_it_owns():
 async def test_node_refuses_to_run_without_a_selection():
     with pytest.raises(ValueError, match="selected_papers"):
         await synthesis_integrity_node(cast(dict, {"domain": "d", "selected_papers": []}))
+
+
+# ------------------------------------------------------------------
+# Contract with report_assembly.py (Agent 4 owner's file, on main)
+#
+# These call the REAL rendering functions rather than asserting on key
+# names in isolation. A mismatch there fails silently -- the report
+# renders em dashes and the Copilot index goes empty -- so the only
+# useful test is an end-to-end one against their actual code.
+# ------------------------------------------------------------------
+
+from backend.agents.report_assembly import (  # noqa: E402
+    render_evidence_table, render_contradictions, chunk_report,
+)
+from backend.agents.synthesis_integrity import (  # noqa: E402
+    CONSUMER_ROW_KEYS, CONSUMER_CONTRADICTION_KEYS, _contradiction_summary,
+)
+
+
+def make_full_row(**overrides) -> dict:
+    """A row with every key build_evidence_row() actually emits."""
+    base = make_row()
+    base.update({
+        "abstract_summary": "An abstract summary.",
+        "method": base["methodology_summary"],
+        "finding": base["results_summary"],
+    })
+    base.update(overrides)
+    return base
+
+
+def make_contradiction(**overrides) -> dict:
+    row_a, row_b = make_row(title="Paper A"), make_row(title="Paper B")
+    base = {
+        "description": "Opposite accuracy rankings between CNN and ViT.",
+        "paper_a_title": "Paper A", "paper_a_claim": "CNN beats ViT",
+        "paper_b_title": "Paper B", "paper_b_claim": "ViT beats CNN",
+        "shortlist_similarity": 0.81,
+        "summary": _contradiction_summary(
+            "Opposite accuracy rankings between CNN and ViT.",
+            row_a, "CNN beats ViT", row_b, "ViT beats CNN"),
+    }
+    base.update(overrides)
+    return base
+
+
+def test_evidence_row_carries_every_key_report_assembly_reads():
+    row = make_full_row()
+    missing = [k for k in CONSUMER_ROW_KEYS if k not in row]
+    assert not missing, f"report_assembly reads {missing}, which Agent 3 does not emit"
+
+
+def test_contradiction_carries_every_key_report_assembly_reads():
+    item = make_contradiction()
+    missing = [k for k in CONSUMER_CONTRADICTION_KEYS if k not in item]
+    assert not missing, f"report_assembly reads {missing}, which Agent 3 does not emit"
+
+
+def test_rendered_evidence_table_is_not_a_row_of_dashes():
+    """The regression this whole section exists for: before the `method` /
+    `finding` aliases landed, every row rendered as `| title | — | — |`."""
+    markdown = render_evidence_table([make_full_row()])
+
+    assert "A CNN trained on PlantVillage." in markdown
+    assert "Reports 97% accuracy on PlantVillage." in markdown
+    body = [ln for ln in markdown.splitlines() if ln.startswith("| Paper")][0]
+    assert "—" not in body
+
+
+def test_rendered_contradiction_is_not_a_dash():
+    markdown = render_contradictions([make_contradiction()])
+    assert "CNN beats ViT" in markdown
+    assert "ViT beats CNN" in markdown
+    assert "- —" not in markdown
+
+
+def test_chunks_carry_real_content_to_the_copilot_index():
+    """chunk_report() feeds the FAISS index. If it only gets titles, the
+    chat cannot answer anything about methods, results or conflicts."""
+    chunks = chunk_report({
+        "evidence_table": [make_full_row()],
+        "contradictions": [make_contradiction()],
+        "gaps": [],
+    })
+
+    by_section = {c["section"]: c["text"] for c in chunks}
+    assert "evidence" in by_section
+    assert "conflicts" in by_section, "the contradiction produced no chunk at all"
+    assert "A CNN trained on PlantVillage." in by_section["evidence"]
+    assert "Reports 97% accuracy on PlantVillage." in by_section["evidence"]
+    assert "CNN beats ViT" in by_section["conflicts"]
+
+
+def test_contradiction_summary_stands_alone_without_claims():
+    """Summary is the ONLY field rendered, so it must still say something
+    useful when the model returns no per-paper claims."""
+    summary = _contradiction_summary("", make_row(title="A"), "", make_row(title="B"), "")
+    assert "A" in summary and "B" in summary
+    assert summary.strip()

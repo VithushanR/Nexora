@@ -55,6 +55,28 @@ from backend.graph.state import ResearchState, Candidate
 
 logger = logging.getLogger("nexora.agent3")
 
+# ------------------------------------------------------------------
+# Consumer contract with report_assembly.py
+# ------------------------------------------------------------------
+# report_assembly.py (Agent 4's owner, already on main) reads specific key
+# names off our rows, and reads NOTHING else -- render_evidence_table()
+# takes row["method"] / row["finding"], render_contradictions() takes
+# item["summary"], and chunk_report() indexes those same keys for the
+# Copilot chat. A key it doesn't find renders as an em dash, silently:
+# no crash, just a table of blanks and an empty search index.
+#
+# So we emit those names alongside our own more descriptive ones. The
+# duplication is deliberate -- our names say what the field actually is
+# (a methodology summary, not a "method"), and the frontend's
+# EvidenceTable/ContradictionCard components can use the richer set,
+# while report_assembly keeps working untouched.
+#
+# The tests at the bottom of test_synthesis_integrity.py assert against
+# the real report_assembly functions, so if either side renames a key the
+# suite fails instead of the report quietly going blank.
+CONSUMER_ROW_KEYS = ("title", "method", "finding")
+CONSUMER_CONTRADICTION_KEYS = ("summary",)
+
 SECTION_WINDOW_CHARS = 6000
 SUMMARY_INPUT_CHARS = 5000
 PAPER_CONCURRENCY = int(os.getenv("SYNTHESIS_PAPER_CONCURRENCY", "4"))
@@ -290,6 +312,10 @@ async def build_evidence_row(client: httpx.AsyncClient, paper: Candidate) -> dic
         "abstract_summary": abstract_summary,
         "methodology_summary": methodology_summary,
         "results_summary": results_summary,
+        # Consumer contract -- see CONSUMER_ROW_KEYS below. Same values as
+        # the two fields above, under the names report_assembly.py reads.
+        "method": methodology_summary,
+        "finding": results_summary,
         "retracted": retraction["retracted"],
         "retraction_status": retraction["status"],
         "retraction_note": retraction["note"],
@@ -311,6 +337,8 @@ def _failed_row(paper: Candidate, error: Exception) -> dict:
         "abstract_summary": _system_note(f"Processing failed: {type(error).__name__}."),
         "methodology_summary": _system_note("Processing failed for this paper."),
         "results_summary": _system_note("Processing failed for this paper."),
+        "method": _system_note("Processing failed for this paper."),
+        "finding": _system_note("Processing failed for this paper."),
         "retracted": None,
         "retraction_status": "unknown",
         "retraction_note": "Not checked -- processing failed before the integrity lookup.",
@@ -404,6 +432,24 @@ Methodology: {row_b['methodology_summary']}
 Results: {row_b['results_summary']}"""
 
 
+def _contradiction_summary(description: str, row_a: dict, claim_a: str,
+                           row_b: dict, claim_b: str) -> str:
+    """One self-contained sentence describing the conflict.
+
+    Must stand alone: report_assembly.py renders ONLY this field and feeds
+    ONLY this field to the Copilot chat index, so anything left out of it
+    is invisible downstream no matter how good the structured fields are.
+    """
+    parts = [description.strip()] if description.strip() else []
+    if claim_a.strip():
+        parts.append(f'"{row_a["title"]}" claims: {claim_a.strip()}')
+    if claim_b.strip():
+        parts.append(f'"{row_b["title"]}" claims: {claim_b.strip()}')
+    if not parts:
+        parts.append(f'"{row_a["title"]}" and "{row_b["title"]}" report conflicting results.')
+    return " — ".join(parts)
+
+
 async def confirm_contradiction(row_a: dict, row_b: dict, similarity: float) -> Optional[dict]:
     """Returns a contradiction record, or None if the pair does not
     genuinely conflict or could not be checked. None is the common,
@@ -419,13 +465,19 @@ async def confirm_contradiction(row_a: dict, row_b: dict, similarity: float) -> 
     if result.get("is_contradiction") is not True:
         return None
 
+    description = result.get("description", "")
+    claim_a = result.get("paper_a_claim", "")
+    claim_b = result.get("paper_b_claim", "")
+
     return {
-        "description": result.get("description", ""),
+        "description": description,
         "paper_a_title": row_a["title"],
-        "paper_a_claim": result.get("paper_a_claim", ""),
+        "paper_a_claim": claim_a,
         "paper_b_title": row_b["title"],
-        "paper_b_claim": result.get("paper_b_claim", ""),
+        "paper_b_claim": claim_b,
         "shortlist_similarity": round(similarity, 4),
+        # Consumer contract -- see CONSUMER_CONTRADICTION_KEYS below.
+        "summary": _contradiction_summary(description, row_a, claim_a, row_b, claim_b),
     }
 
 
