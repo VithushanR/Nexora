@@ -1,7 +1,14 @@
 // Typed fetch wrapper for the FastAPI backend. Part D can later inject
 // authentication headers through setAuthHeadersProvider without changing page code.
 
-import type { ResearchStartRequest, ResearchStartResponse } from "../types";
+import type {
+  CandidatesResponse,
+  ResearchStartRequest,
+  ResearchStartResponse,
+  ResearchStatusResponse,
+  SelectionRequest,
+  SelectionResponse,
+} from "../types";
 
 export type AuthHeadersProvider = () => Promise<Record<string, string>>;
 
@@ -107,4 +114,32 @@ export async function startResearch(
     throw new ApiClientError(201, "The research service returned an invalid response.");
   }
   return response;
+}
+
+function researchPath(threadId: string, suffix = ""): string {
+  return `/research/${encodeURIComponent(threadId)}${suffix}`;
+}
+
+export async function getResearchStatus(
+  threadId: string,
+): Promise<ResearchStatusResponse> {
+  return requestJson<ResearchStatusResponse>(
+    researchPath(threadId, "/status"),
+  );
+}
+
+export async function getCandidates(threadId: string): Promise<CandidatesResponse> {
+  return requestJson<CandidatesResponse>(
+    researchPath(threadId, "/candidates"),
+  );
+}
+
+export async function submitSelection(
+  threadId: string,
+  request: SelectionRequest,
+): Promise<SelectionResponse> {
+  return requestJson<SelectionResponse>(researchPath(threadId, "/select"), {
+    method: "POST",
+    body: JSON.stringify({ selected_indices: request.selected_indices }),
+  });
 }
