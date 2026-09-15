@@ -14,9 +14,8 @@ Topology (per the project doc):
                                                                 |
                                                         report_assembly -> END
 
-CURRENT STATE: Agent 1 (protocol_planning) and Agent 2
-(retrieval_screening) are wired in. Everything after retrieval is a TODO
-block below, in topology order -- uncomment as each node lands.
+All four agents and report assembly are wired. Agent 3 and Agent 4 fan out
+from the human checkpoint and synchronise at report assembly.
 """
 
 from collections.abc import AsyncIterator, Callable
@@ -31,20 +30,9 @@ from backend.graph.state import ResearchState
 from backend.agents.protocol_planning import protocol_planning_node
 from backend.agents.retrieval_screening import retrieval_screening_node
 from backend.agents.human_selection import human_selection_node
-
-# TODO(agent-3-owner): implement backend/agents/synthesis_integrity.py.
-# Writes evidence_table, contradictions, contradictions_status to state.
-# from backend.agents.synthesis_integrity import synthesis_integrity_node
-
-# TODO(agent-4-owner): implement backend/agents/gap_discovery.py. Writes
-# gaps, gaps_status to state. Must run as a genuinely independent branch
-# from Agent 3 -- do not read anything Agent 3 wrote.
-# from backend.agents.gap_discovery import gap_discovery_node
-
-# TODO(report-assembly-owner): implement backend/agents/report_assembly.py.
-# NO LLM call here -- pure merge of evidence_table + contradictions + gaps
-# into `report`.
-# from backend.agents.report_assembly import report_assembly_node
+from backend.agents.synthesis_integrity import synthesis_integrity_node
+from backend.agents.gap_discovery import gap_discovery_node
+from backend.agents.report_assembly import report_assembly_node
 
 
 def build_graph() -> StateGraph:
@@ -55,27 +43,19 @@ def build_graph() -> StateGraph:
     graph.add_node("protocol_planning", protocol_planning_node)
     graph.add_node("retrieval_screening", retrieval_screening_node)
     graph.add_node("human_selection", human_selection_node)
+    graph.add_node("synthesis_integrity", synthesis_integrity_node)
+    graph.add_node("gap_discovery", gap_discovery_node)
+    graph.add_node("report_assembly", report_assembly_node)
     graph.add_edge(START, "protocol_planning")
     graph.add_edge("protocol_planning", "retrieval_screening")
     graph.add_edge("retrieval_screening", "human_selection")
-    graph.add_edge("human_selection", END)  # TODO: replace once Agent 3/4 are wired
-
-    # TODO(agent-3-owner, agent-4-owner): fan-out -- both branches read
-    # `selected_papers` and run independently; LangGraph runs them in the
-    # same step automatically since neither depends on the other's output.
-    #
-    # graph.add_node("synthesis_integrity", synthesis_integrity_node)
-    # graph.add_node("gap_discovery", gap_discovery_node)
-    # graph.add_edge("human_selection", "synthesis_integrity")
-    # graph.add_edge("human_selection", "gap_discovery")
-
-    # TODO(report-assembly-owner): fan-in -- LangGraph automatically waits
-    # for BOTH synthesis_integrity and gap_discovery before running this.
-    #
-    # graph.add_node("report_assembly", report_assembly_node)
-    # graph.add_edge("synthesis_integrity", "report_assembly")
-    # graph.add_edge("gap_discovery", "report_assembly")
-    # graph.add_edge("report_assembly", END)
+    # Fan-out: both agents read the same checkpointed selected papers and
+    # write disjoint state fields.
+    graph.add_edge("human_selection", "synthesis_integrity")
+    graph.add_edge("human_selection", "gap_discovery")
+    # LangGraph's list-source edge is its explicit wait-for-all fan-in API.
+    graph.add_edge(["synthesis_integrity", "gap_discovery"], "report_assembly")
+    graph.add_edge("report_assembly", END)
 
     return graph
 
