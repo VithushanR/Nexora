@@ -6,6 +6,7 @@ import type {
   ResearchStartRequest,
   ResearchStartResponse,
   ResearchStatusResponse,
+  ReportResponse,
   SelectionRequest,
   SelectionResponse,
 } from "../types";
@@ -142,4 +143,15 @@ export async function submitSelection(
     method: "POST",
     body: JSON.stringify({ selected_indices: request.selected_indices }),
   });
+}
+
+export async function getResearchReport(threadId: string): Promise<ReportResponse> {
+  const response = await requestJson<ReportResponse>(
+    researchPath(threadId, "/report"),
+  );
+
+  if (typeof response?.report !== "string") {
+    throw new ApiClientError(200, "The research service returned an invalid report.");
+  }
+  return response;
 }
