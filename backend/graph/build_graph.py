@@ -25,12 +25,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from backend.graph.state import ResearchState
 from backend.agents.protocol_planning import protocol_planning_node
 from backend.agents.retrieval_screening import retrieval_screening_node
-
-# TODO(human-checkpoint-owner): implement the interrupt()-based selection
-# node. Requires the checkpointer already wired in below (MemorySaver for
-# now -- swap to langgraph.checkpoint.sqlite.SqliteSaver so paused state
-# survives across separate HTTP requests, not just this process's memory).
-# from backend.agents.human_selection import human_selection_node
+from backend.agents.human_selection import human_selection_node
 
 # TODO(agent-3-owner): implement backend/agents/synthesis_integrity.py.
 # Writes evidence_table, contradictions, contradictions_status to state.
@@ -54,15 +49,11 @@ def build_graph() -> StateGraph:
     # papers, because Agent 2 reads protocol criteria and per-source queries.
     graph.add_node("protocol_planning", protocol_planning_node)
     graph.add_node("retrieval_screening", retrieval_screening_node)
+    graph.add_node("human_selection", human_selection_node)
     graph.add_edge(START, "protocol_planning")
     graph.add_edge("protocol_planning", "retrieval_screening")
-    graph.add_edge("retrieval_screening", END)  # TODO: remove once human_selection exists
-
-    # TODO(human-checkpoint-owner): uncomment, then REMOVE the
-    # "retrieval_screening" -> END edge above.
-    #
-    # graph.add_node("human_selection", human_selection_node)
-    # graph.add_edge("retrieval_screening", "human_selection")
+    graph.add_edge("retrieval_screening", "human_selection")
+    graph.add_edge("human_selection", END)  # TODO: replace once Agent 3/4 are wired
 
     # TODO(agent-3-owner, agent-4-owner): fan-out -- both branches read
     # `selected_papers` and run independently; LangGraph runs them in the

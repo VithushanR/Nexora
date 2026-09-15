@@ -189,4 +189,5 @@ def test_graph_topology_starts_with_agent1_then_agent2(monkeypatch):
     graph = build_graph()
     assert ("__start__", "protocol_planning") in graph.edges
     assert ("protocol_planning", "retrieval_screening") in graph.edges
-    assert ("retrieval_screening", "__end__") in graph.edges
+    assert ("retrieval_screening", "human_selection") in graph.edges
+    assert ("human_selection", "__end__") in graph.edges
