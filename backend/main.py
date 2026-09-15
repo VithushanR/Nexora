@@ -11,8 +11,8 @@ Responsibility:
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import get_settings
-from routers import search, selection, chat
+from backend.config import get_settings
+from backend.routers import chat, research, search, selection
 
 # TODO: read allowed origins from config instead of hardcoding
 settings = get_settings()
@@ -32,6 +32,7 @@ app.add_middleware(
 app.include_router(search.router)
 app.include_router(selection.router)
 app.include_router(chat.router)
+app.include_router(research.router)
 
 
 @app.get("/health")
