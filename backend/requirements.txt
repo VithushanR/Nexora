@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 langgraph
 langgraph-checkpoint-sqlite
+aiosqlite
 langchain-google-genai
 google-genai
 httpx
