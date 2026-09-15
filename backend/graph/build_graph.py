@@ -19,9 +19,14 @@ CURRENT STATE: Agent 1 (protocol_planning) and Agent 2
 block below, in topology order -- uncomment as each node lands.
 """
 
-from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from typing import Any
 
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+from backend.config import get_settings
 from backend.graph.state import ResearchState
 from backend.agents.protocol_planning import protocol_planning_node
 from backend.agents.retrieval_screening import retrieval_screening_node
@@ -75,7 +80,12 @@ def build_graph() -> StateGraph:
     return graph
 
 
-# MemorySaver for local dev. Swap for SqliteSaver once human_selection's
-# interrupt() lands, so paused state survives across separate requests.
-checkpointer = MemorySaver()
-app = build_graph().compile(checkpointer=checkpointer)
+@asynccontextmanager
+async def graph_context(
+    sqlite_db_path: str | None = None,
+    graph_builder: Callable[[], StateGraph] = build_graph,
+) -> AsyncIterator[Any]:
+    """Yield a compiled graph while its async SQLite checkpointer is open."""
+    db_path = sqlite_db_path or get_settings().sqlite_db_path
+    async with AsyncSqliteSaver.from_conn_string(db_path) as checkpointer:
+        yield graph_builder().compile(checkpointer=checkpointer)
