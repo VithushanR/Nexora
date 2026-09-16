@@ -4,3 +4,5 @@ venv/
 *.db
 node_modules/
 dist/
+backend/uploads/*
+!backend/uploads/.gitkeep
