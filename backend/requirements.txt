@@ -18,6 +18,7 @@ pydantic-settings
 python-dotenv
 reportlab
 PyJWT
+python-multipart
 
 # --- dev / test ---
 pytest
