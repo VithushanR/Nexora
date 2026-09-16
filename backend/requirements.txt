@@ -17,6 +17,7 @@ pydantic
 pydantic-settings
 python-dotenv
 reportlab
+PyJWT
 
 # --- dev / test ---
 pytest
