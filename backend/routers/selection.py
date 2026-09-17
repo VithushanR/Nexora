@@ -11,8 +11,6 @@ Responsibility:
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from graph.build_graph import build_graph
-
 router = APIRouter(prefix="/select", tags=["selection"])
 
 
