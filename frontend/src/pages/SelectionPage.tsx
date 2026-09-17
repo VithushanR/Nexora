@@ -45,6 +45,15 @@ function selectionErrorMessage(error: unknown): string {
   return "Paper selection could not be submitted.";
 }
 
+import { useCallback, useEffect, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import { getStatus, getCandidates, submitSelection, ApiError } from "../api/client";
+import type { Candidate } from "../types";
+import PaperCard from "../components/PaperCard";
+
+const DEFAULT_PRESELECT = 20;
+const POLL_MS = 2500;
+
 export default function SelectionPage() {
   const { runId } = useParams<{ runId: string }>();
   const navigate = useNavigate();
