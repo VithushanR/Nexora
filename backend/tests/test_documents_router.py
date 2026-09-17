@@ -28,10 +28,10 @@ import routers.documents as documents_module
 from routers.documents import router, UPLOAD_DIR, _get_db
 from auth.jwt import get_current_user
 
+
 # ---------------------------------------------------------------------------
 # Test app setup
 # ---------------------------------------------------------------------------
-
 
 def _make_test_app(user_id: str = "user_alice") -> FastAPI:
     app = FastAPI()
@@ -42,9 +42,7 @@ def _make_test_app(user_id: str = "user_alice") -> FastAPI:
     return app
 
 
-def _make_real_pdf_bytes(
-    text: str = "Graph neural networks are a class of models.",
-) -> bytes:
+def _make_real_pdf_bytes(text: str = "Graph neural networks are a class of models.") -> bytes:
     buf = io.BytesIO()
     c = canvas.Canvas(buf)
     c.drawString(100, 750, text)
@@ -70,13 +68,9 @@ def clean_state(monkeypatch):
 
     monkeypatch.setattr(documents_module, "build_index", lambda chunks, namespace: None)
     monkeypatch.setattr(
-        documents_module,
-        "rag_chat",
-        lambda namespace, question, system_prompt=None: f"Mocked answer for: {question}",
+        documents_module, "rag_chat", lambda namespace, question, system_prompt=None: f"Mocked answer for: {question}"
     )
-    monkeypatch.setattr(
-        documents_module, "_delete_rag_index_files", lambda document_id: None
-    )
+    monkeypatch.setattr(documents_module, "_delete_rag_index_files", lambda document_id: None)
 
     yield
 
@@ -87,7 +81,6 @@ def clean_state(monkeypatch):
 # ---------------------------------------------------------------------------
 # Upload validation (order matters, per §D.1)
 # ---------------------------------------------------------------------------
-
 
 class TestUploadValidation:
     def test_valid_pdf_upload_succeeds(self):
@@ -124,9 +117,7 @@ class TestUploadValidation:
         assert "magic-byte" in response.json()["detail"].lower()
 
     def test_rejects_oversized_file(self, monkeypatch):
-        monkeypatch.setattr(
-            documents_module, "UPLOAD_MAX_SIZE_BYTES", 10
-        )  # 10 bytes, trivially exceeded
+        monkeypatch.setattr(documents_module, "UPLOAD_MAX_SIZE_BYTES", 10)  # 10 bytes, trivially exceeded
 
         app = _make_test_app()
         client = TestClient(app)
@@ -190,6 +181,68 @@ class TestUploadValidation:
 # Owner-only access control
 # ---------------------------------------------------------------------------
 
+class TestEncryptionAtRest:
+    """
+    D.1 step 5: 'Store the file under UPLOAD_DIR, encrypted at rest.'
+    Confirms the file actually written to disk is not plaintext PDF
+    bytes -- i.e. encryption is really happening, not just present in
+    the codebase unused.
+    """
+
+    def test_stored_file_is_not_plaintext_pdf(self):
+        app = _make_test_app()
+        client = TestClient(app)
+
+        pdf_bytes = _make_real_pdf_bytes()
+        response = client.post(
+            "/documents/upload", files={"file": ("paper.pdf", pdf_bytes, "application/pdf")}
+        )
+        document_id = response.json()["document_id"]
+
+        stored_path = os.path.join(UPLOAD_DIR, f"{document_id}.pdf")
+        with open(stored_path, "rb") as f:
+            stored_bytes = f.read()
+
+        # The file on disk must NOT start with the real PDF magic bytes --
+        # if it does, it was never actually encrypted.
+        assert not stored_bytes.startswith(b"%PDF-")
+        assert stored_bytes != pdf_bytes
+
+    def test_stored_file_decrypts_back_to_original(self):
+        from auth.encryption import decrypt_bytes
+
+        app = _make_test_app()
+        client = TestClient(app)
+
+        pdf_bytes = _make_real_pdf_bytes()
+        response = client.post(
+            "/documents/upload", files={"file": ("paper.pdf", pdf_bytes, "application/pdf")}
+        )
+        document_id = response.json()["document_id"]
+
+        stored_path = os.path.join(UPLOAD_DIR, f"{document_id}.pdf")
+        with open(stored_path, "rb") as f:
+            stored_bytes = f.read()
+
+        assert decrypt_bytes(stored_bytes) == pdf_bytes
+
+    def test_no_leftover_plaintext_temp_file(self):
+        """
+        The temp file used for pypdf parsing (plaintext, by necessity)
+        must be removed, not left sitting on disk after upload completes.
+        """
+        app = _make_test_app()
+        client = TestClient(app)
+
+        pdf_bytes = _make_real_pdf_bytes()
+        response = client.post(
+            "/documents/upload", files={"file": ("paper.pdf", pdf_bytes, "application/pdf")}
+        )
+        document_id = response.json()["document_id"]
+
+        temp_path = os.path.join(UPLOAD_DIR, f"_tmp_{document_id}.pdf")
+        assert not os.path.exists(temp_path)
+
 
 class TestOwnership:
     def _upload_as(self, user_id: str) -> str:
@@ -208,8 +261,7 @@ class TestOwnership:
         app = _make_test_app(user_id="user_alice")
         client = TestClient(app)
         response = client.post(
-            f"/documents/{document_id}/chat",
-            json={"message": "What is this paper about?"},
+            f"/documents/{document_id}/chat", json={"message": "What is this paper about?"}
         )
 
         assert response.status_code == 200
@@ -247,21 +299,17 @@ class TestOwnership:
 # Chat + history
 # ---------------------------------------------------------------------------
 
-
 class TestChatAndHistory:
     def test_chat_message_too_long_rejected(self):
         app = _make_test_app()
         client = TestClient(app)
         pdf_bytes = _make_real_pdf_bytes()
         document_id = client.post(
-            "/documents/upload",
-            files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
+            "/documents/upload", files={"file": ("paper.pdf", pdf_bytes, "application/pdf")}
         ).json()["document_id"]
 
         huge_message = "a" * 5000
-        response = client.post(
-            f"/documents/{document_id}/chat", json={"message": huge_message}
-        )
+        response = client.post(f"/documents/{document_id}/chat", json={"message": huge_message})
 
         assert response.status_code == 400
 
@@ -270,13 +318,10 @@ class TestChatAndHistory:
         client = TestClient(app)
         pdf_bytes = _make_real_pdf_bytes()
         document_id = client.post(
-            "/documents/upload",
-            files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
+            "/documents/upload", files={"file": ("paper.pdf", pdf_bytes, "application/pdf")}
         ).json()["document_id"]
 
-        client.post(
-            f"/documents/{document_id}/chat", json={"message": "Summarize this."}
-        )
+        client.post(f"/documents/{document_id}/chat", json={"message": "Summarize this."})
 
         history = client.get(f"/documents/{document_id}/chat/history").json()
 
@@ -297,8 +342,7 @@ class TestChatAndHistory:
         client = TestClient(app)
         pdf_bytes = _make_real_pdf_bytes()
         document_id = client.post(
-            "/documents/upload",
-            files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
+            "/documents/upload", files={"file": ("paper.pdf", pdf_bytes, "application/pdf")}
         ).json()["document_id"]
 
         client.post(
@@ -314,15 +358,13 @@ class TestChatAndHistory:
 # Deletion (D.4: must remove file AND RAG index, verified with a test)
 # ---------------------------------------------------------------------------
 
-
 class TestDeletion:
     def test_delete_removes_file_and_db_row(self):
         app = _make_test_app()
         client = TestClient(app)
         pdf_bytes = _make_real_pdf_bytes()
         upload_response = client.post(
-            "/documents/upload",
-            files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
+            "/documents/upload", files={"file": ("paper.pdf", pdf_bytes, "application/pdf")}
         ).json()
         document_id = upload_response["document_id"]
 
@@ -352,17 +394,14 @@ class TestDeletion:
         """
         captured = {}
         monkeypatch.setattr(
-            documents_module,
-            "_delete_rag_index_files",
-            lambda document_id: captured.setdefault("id", document_id),
+            documents_module, "_delete_rag_index_files", lambda document_id: captured.setdefault("id", document_id)
         )
 
         app = _make_test_app()
         client = TestClient(app)
         pdf_bytes = _make_real_pdf_bytes()
         document_id = client.post(
-            "/documents/upload",
-            files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
+            "/documents/upload", files={"file": ("paper.pdf", pdf_bytes, "application/pdf")}
         ).json()["document_id"]
 
         client.delete(f"/documents/{document_id}")
@@ -374,8 +413,7 @@ class TestDeletion:
         client = TestClient(app)
         pdf_bytes = _make_real_pdf_bytes()
         document_id = client.post(
-            "/documents/upload",
-            files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
+            "/documents/upload", files={"file": ("paper.pdf", pdf_bytes, "application/pdf")}
         ).json()["document_id"]
 
         client.delete(f"/documents/{document_id}")

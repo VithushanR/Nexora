@@ -19,15 +19,13 @@ Upload validation order (non-negotiable, §D.1):
     3. Extract text (pypdf) -- treat as fully untrusted, MORE so than
        arXiv PDFs, since this is arbitrary user input
     4. Chunk + embed into an isolated namespace: document:{document_id}
-    5. Store the file under UPLOAD_DIR, scoped to the uploading user
-       (encryption at rest is a separate follow-up task, not yet wired
-       in this file -- see the TODO near _save_upload_file)
+    5. Store the file under UPLOAD_DIR, encrypted at rest (auth/encryption.py),
+       scoped to the uploading user
 
 Every document-scoped route is owner-only: a user can only touch their
-own documents. 403 (not 404) is returned for a document that exists but
-belongs to someone else, so we don't leak whether a document_id is valid
-to a non-owner -- actually, per common practice here we return 404 to
-avoid confirming existence at all; see _get_owned_document_or_404.
+own documents. A document that exists but belongs to someone else
+returns 404 (not 403), so a non-owner can't distinguish "doesn't exist"
+from "exists, not yours" -- see _get_owned_document_or_404.
 """
 
 import os
@@ -39,6 +37,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, status
 from pypdf import PdfReader
 
+from auth.encryption import encrypt_bytes
 from auth.jwt import get_current_user
 from auth.sanitize import sanitize_for_prompt
 from rag.chat import build_index, rag_chat
@@ -228,7 +227,7 @@ async def upload_document(
         2. Real PDF magic-byte check (not just filename/extension)
         3. Text extraction (treated as fully untrusted)
         4. Chunk + embed into an isolated namespace
-        5. Store the file under UPLOAD_DIR
+        5. Store the file under UPLOAD_DIR, encrypted at rest
     """
     # --- 1. Size check ---
     content_length = request.headers.get("content-length")
@@ -296,14 +295,17 @@ async def upload_document(
     # --- 4. Chunk + embed into isolated namespace ---
     build_index(chunks, namespace=_document_namespace(document_id))
 
-    # --- 5. Store the file under UPLOAD_DIR ---
-    # TODO(Part D, encryption-at-rest task): encrypt file_bytes with
-    # Fernet(ENCRYPTION_KEY) before writing, per D.3/D.4. Stored in
-    # plaintext for now so upload/chat/delete can be built and tested
-    # end-to-end first; encryption is being added as an immediate follow-up.
+    # --- 5. Store the file under UPLOAD_DIR, encrypted at rest ---
+    # file_bytes (the original plaintext upload) is encrypted and written
+    # to final_path. temp_path (plaintext, used only for pypdf parsing
+    # above) is removed rather than renamed, since it must never persist
+    # on disk unencrypted.
     title = file.filename or f"document-{document_id}.pdf"
     final_path = os.path.join(UPLOAD_DIR, f"{document_id}.pdf")
-    os.replace(temp_path, final_path)
+    encrypted_bytes = encrypt_bytes(file_bytes)
+    with open(final_path, "wb") as f:
+        f.write(encrypted_bytes)
+    os.remove(temp_path)
 
     conn = _get_db()
     try:
