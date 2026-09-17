@@ -1,110 +1,122 @@
-import { useState } from "react";
+import { FormEvent, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { startResearch, ApiError } from "../api/client";
-import { addHistory } from "../components/Sidebar";
 
-const EXAMPLES = [
-  "AI for early crop disease detection",
-  "Machine learning for sepsis prediction",
-  "Transformer models for low-resource languages",
-  "Wearable sensors for fall detection in the elderly",
-];
+import {
+  ApiClientError,
+  ApiConfigurationError,
+  ApiNetworkError,
+  startResearch,
+} from "../api/client";
+
+function userFacingError(error: unknown): string {
+  if (error instanceof ApiClientError) {
+    if (error.status === 503) {
+      return "Research sign-in/setup is not configured yet. Please try again after authentication is enabled.";
+    }
+    if (error.status === 422) {
+      return "This research topic was rejected. Please enter a clear academic research topic.";
+    }
+    if (error.status === 429) {
+      return "Too many research requests were made. Please wait and try again later.";
+    }
+    if (error.status === 500) {
+      return "Research could not be started. Please try again later.";
+    }
+    return "The research service could not complete the request. Please try again.";
+  }
+  if (error instanceof ApiConfigurationError) {
+    return "The frontend is not configured with a backend API URL.";
+  }
+  if (error instanceof ApiNetworkError) {
+    return "Unable to reach the research service. Check the connection and try again.";
+  }
+  return "Something went wrong while starting research. Please try again.";
+}
 
 export default function SearchPage() {
-  const [domain, setDomain] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const navigate = useNavigate();
+  const [domain, setDomain] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  async function runSearch(value: string) {
-    const trimmed = value.trim();
-    if (!trimmed) return;
-    setLoading(true);
-    setError(null);
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (isSubmitting) {
+      return;
+    }
+
+    const trimmedDomain = domain.trim();
+    if (!trimmedDomain) {
+      setErrorMessage("Please enter a research topic before starting.");
+      return;
+    }
+
+    setErrorMessage(null);
+    setIsSubmitting(true);
     try {
-      const { thread_id } = await startResearch(trimmed);
-      addHistory(thread_id, trimmed);
+      const { thread_id } = await startResearch({ domain: trimmedDomain });
       navigate(`/select/${thread_id}`);
-    } catch (e) {
-      setError(
-        e instanceof ApiError ? e.message : "Could not start the search. Please try again."
-      );
-      setLoading(false);
+    } catch (error) {
+      setErrorMessage(userFacingError(error));
+    } finally {
+      setIsSubmitting(false);
     }
   }
 
   return (
-    <div className="flex h-full flex-col items-center px-6 pt-[18vh]">
-      {/* Logo + tagline */}
-      <div className="mb-2 flex items-center gap-2">
-        <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-600 text-lg font-bold text-white">
-          N
-        </div>
-        <span className="text-2xl font-semibold text-slate-900">Nexora</span>
-      </div>
-      <h1 className="mb-10 text-center text-3xl font-bold text-slate-900">
-        Research starts here
-      </h1>
+    <main className="min-h-screen bg-slate-50 px-4 py-12 text-slate-900 sm:px-6">
+      <section className="mx-auto w-full max-w-2xl rounded-xl bg-white p-6 shadow-sm ring-1 ring-slate-200 sm:p-10">
+        <p className="text-sm font-semibold uppercase tracking-wide text-blue-700">Nexora</p>
+        <h1 className="mt-2 text-3xl font-bold tracking-tight sm:text-4xl">
+          Start a research investigation
+        </h1>
+        <p className="mt-4 text-base leading-7 text-slate-600">
+          Enter a research topic. Nexora will find and screen academic papers, then ask you to choose the papers for the final report.
+        </p>
 
-      {/* Search bar */}
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          runSearch(domain);
-        }}
-        className="w-full max-w-2xl"
-      >
-        <div className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm ring-1 ring-slate-900/5 transition-all focus-within:border-blue-400 focus-within:ring-2 focus-within:ring-blue-100">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" className="shrink-0 text-slate-400">
-            <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2" />
-            <path d="M21 21l-4.3-4.3" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-          </svg>
-          <input
-            value={domain}
-            onChange={(e) => setDomain(e.target.value)}
-            placeholder="e.g. AI for early crop disease detection"
-            className="flex-1 bg-transparent text-base text-slate-900 outline-none placeholder:text-slate-400"
-          />
+        <form className="mt-8 space-y-5" onSubmit={handleSubmit} noValidate>
+          <div>
+            <label className="block text-sm font-medium text-slate-800" htmlFor="research-topic">
+              Research topic
+            </label>
+            <textarea
+              id="research-topic"
+              name="domain"
+              value={domain}
+              onChange={(event) => setDomain(event.target.value)}
+              disabled={isSubmitting}
+              rows={5}
+              placeholder="For example: the impact of sleep quality on university academic performance"
+              className="mt-2 block w-full resize-y rounded-md border border-slate-300 px-3 py-2 text-base shadow-sm outline-none focus:border-blue-600 focus:ring-2 focus:ring-blue-100 disabled:cursor-not-allowed disabled:bg-slate-100"
+              aria-describedby={errorMessage ? "research-topic-error" : undefined}
+            />
+          </div>
+
+          {errorMessage && (
+            <p
+              id="research-topic-error"
+              role="alert"
+              className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800"
+            >
+              {errorMessage}
+            </p>
+          )}
+
+          {isSubmitting && (
+            <p className="text-sm text-slate-600" role="status">
+              Finding and screening papers...
+            </p>
+          )}
+
           <button
             type="submit"
-            disabled={loading || !domain.trim()}
-            className="rounded-xl bg-blue-600 px-5 py-2 text-sm font-medium text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={isSubmitting}
+            className="inline-flex w-full items-center justify-center rounded-md bg-blue-700 px-4 py-3 text-sm font-semibold text-white shadow-sm hover:bg-blue-800 focus:outline-none focus:ring-2 focus:ring-blue-600 focus:ring-offset-2 disabled:cursor-not-allowed disabled:bg-slate-400 sm:w-auto"
           >
-            {loading ? "Searching..." : "Search"}
+            {isSubmitting ? "Starting research..." : "Start research"}
           </button>
-        </div>
-      </form>
-
-      {error && <p className="mt-4 text-sm text-rose-600">{error}</p>}
-
-      {/* Example chips */}
-      <div className="mt-8 flex max-w-2xl flex-wrap justify-center gap-2">
-        {EXAMPLES.map((ex) => (
-          <button
-            key={ex}
-            onClick={() => {
-              setDomain(ex);
-              runSearch(ex);
-            }}
-            className="flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-600 transition hover:border-blue-300 hover:text-blue-700"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="text-blue-400">
-              <circle cx="11" cy="11" r="7" />
-              <path d="M21 21l-4.3-4.3" />
-            </svg>
-            {ex}
-          </button>
-        ))}
-      </div>
-
-      {/* Bottom tagline */}
-      <div className="mt-auto pb-8 pt-16">
-        <div className="flex items-center gap-4">
-          <div className="h-px w-16 bg-slate-200" />
-          <p className="text-sm text-slate-400">The new standard for academic research</p>
-          <div className="h-px w-16 bg-slate-200" />
-        </div>
-      </div>
-    </div>
+        </form>
+      </section>
+    </main>
   );
 }

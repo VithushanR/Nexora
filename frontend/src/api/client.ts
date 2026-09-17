@@ -1,163 +1,157 @@
-// Typed fetch wrapper for the FastAPI backend, per nexora_final_split.md
-// §A.1 (research pipeline) and §B.1 (copilot).
+// Typed fetch wrapper for the FastAPI backend. Part D can later inject
+// authentication headers through setAuthHeadersProvider without changing page code.
 
 import type {
-  Candidate,
-  CopilotChatResponse,
-  CopilotHistoryItem,
-  DocumentChatResponse,
-  DocumentHistoryItem,
-  DocumentUploadResponse,
+  CandidatesResponse,
+  ResearchStartRequest,
+  ResearchStartResponse,
+  ResearchStatusResponse,
   ReportResponse,
-  RunStatus,
+  SelectionRequest,
+  SelectionResponse,
 } from "../types";
 
-const BASE_URL = import.meta.env.VITE_API_BASE_URL as string;
-const TOKEN_KEY = "nexora_api_token";
+export type AuthHeadersProvider = () => Promise<Record<string, string>>;
 
-export function getAuthToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
-}
+let authHeadersProvider: AuthHeadersProvider | undefined;
 
-export function setAuthToken(token: string): void {
-  localStorage.setItem(TOKEN_KEY, token);
-}
-
-export function clearAuthToken(): void {
-  localStorage.removeItem(TOKEN_KEY);
-}
-
-export class ApiError extends Error {
-  status: number;
-  constructor(status: number, message: string) {
+export class ApiClientError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
     super(message);
-    this.status = status;
+    this.name = "ApiClientError";
   }
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const token = getAuthToken();
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    ...(options.headers as Record<string, string> | undefined),
-  };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
+export class ApiConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ApiConfigurationError";
+  }
+}
 
-  const res = await fetch(`${BASE_URL}${path}`, { ...options, headers });
+export class ApiNetworkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ApiNetworkError";
+  }
+}
 
-  if (!res.ok) {
-    let message = res.statusText || `Request failed (${res.status})`;
-    try {
-      const body = await res.json();
-      message = body?.detail ?? message;
-    } catch {
-      // response wasn't JSON -- keep the default message
-    }
-    throw new ApiError(res.status, message);
+export function setAuthHeadersProvider(provider?: AuthHeadersProvider): void {
+  authHeadersProvider = provider;
+}
+
+function getBaseUrl(): string {
+  const configuredUrl = import.meta.env.VITE_API_BASE_URL?.trim();
+  if (!configuredUrl) {
+    throw new ApiConfigurationError(
+      "The frontend is missing its backend API URL configuration.",
+    );
+  }
+  return configuredUrl.replace(/\/$/, "");
+}
+
+async function parseJson(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    return undefined;
+  }
+}
+
+function responseDetail(payload: unknown, fallback: string): string {
+  if (
+    typeof payload === "object" &&
+    payload !== null &&
+    "detail" in payload &&
+    typeof payload.detail === "string"
+  ) {
+    return payload.detail;
+  }
+  return fallback;
+}
+
+async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const authHeaders = authHeadersProvider ? await authHeadersProvider() : {};
+  const url = `${getBaseUrl()}${path}`;
+  const headers = new Headers(init.headers);
+  headers.set("Content-Type", "application/json");
+  for (const [name, value] of Object.entries(authHeaders)) {
+    headers.set(name, value);
   }
 
-  if (res.status === 204) return undefined as T;
-  return (await res.json()) as T;
+  let response: Response;
+
+  try {
+    response = await fetch(url, {
+      ...init,
+      headers,
+    });
+  } catch {
+    throw new ApiNetworkError("Unable to connect to the research service.");
+  }
+
+  const payload = await parseJson(response);
+  if (!response.ok) {
+    throw new ApiClientError(
+      response.status,
+      responseDetail(payload, "The research service could not complete the request."),
+    );
+  }
+  return payload as T;
 }
 
-// ---- Part A: research pipeline ----
-
-export function startResearch(domain: string) {
-  return request<{ thread_id: string }>("/research", {
+export async function startResearch(
+  request: ResearchStartRequest,
+): Promise<ResearchStartResponse> {
+  const response = await requestJson<ResearchStartResponse>("/research", {
     method: "POST",
-    body: JSON.stringify({ domain }),
+    body: JSON.stringify({ domain: request.domain }),
   });
+
+  if (typeof response?.thread_id !== "string" || !response.thread_id) {
+    throw new ApiClientError(201, "The research service returned an invalid response.");
+  }
+  return response;
 }
 
-export function getStatus(threadId: string) {
-  return request<RunStatus>(`/research/${threadId}/status`);
+function researchPath(threadId: string, suffix = ""): string {
+  return `/research/${encodeURIComponent(threadId)}${suffix}`;
 }
 
-export function getCandidates(threadId: string) {
-  return request<{ eligible_candidates: Candidate[] }>(
-    `/research/${threadId}/candidates`
-  );
-}
-
-export function submitSelection(threadId: string, selectedIndices: number[]) {
-  return request<{ status: string }>(`/research/${threadId}/select`, {
-    method: "POST",
-    body: JSON.stringify({ selected_indices: selectedIndices }),
-  });
-}
-
-export function getReport(threadId: string) {
-  return request<ReportResponse>(`/research/${threadId}/report`);
-}
-
-// ---- Part B: copilot ----
-
-export function indexCopilot(threadId: string) {
-  return request<{ indexed: boolean; n_chunks: number }>(
-    `/research/${threadId}/copilot/index`,
-    { method: "POST" }
-  );
-}
-
-export function sendCopilotMessage(
+export async function getResearchStatus(
   threadId: string,
-  message: string,
-  mode: "report" | "auto"
-) {
-  return request<CopilotChatResponse>(`/research/${threadId}/copilot/chat`, {
-    method: "POST",
-    body: JSON.stringify({ message, mode }),
-  });
-}
-
-export function addToEvidence(threadId: string, messageId: string) {
-  return request<{ added: boolean }>(
-    `/research/${threadId}/copilot/add_to_evidence`,
-    { method: "POST", body: JSON.stringify({ message_id: messageId }) }
+): Promise<ResearchStatusResponse> {
+  return requestJson<ResearchStatusResponse>(
+    researchPath(threadId, "/status"),
   );
 }
 
-export function getCopilotHistory(threadId: string) {
-  return request<CopilotHistoryItem[]>(`/research/${threadId}/copilot/history`);
+export async function getCandidates(threadId: string): Promise<CandidatesResponse> {
+  return requestJson<CandidatesResponse>(
+    researchPath(threadId, "/candidates"),
+  );
 }
 
-// ---- Part D: document upload & chat ----
-
-export async function uploadDocument(file: File): Promise<DocumentUploadResponse> {
-  const token = getAuthToken();
-  const formData = new FormData();
-  formData.append("file", file);
-
-  const headers: Record<string, string> = {};
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-
-  const res = await fetch(`${BASE_URL}/documents/upload`, {
+export async function submitSelection(
+  threadId: string,
+  request: SelectionRequest,
+): Promise<SelectionResponse> {
+  return requestJson<SelectionResponse>(researchPath(threadId, "/select"), {
     method: "POST",
-    headers,
-    body: formData,
+    body: JSON.stringify({ selected_indices: request.selected_indices }),
   });
+}
 
-  if (!res.ok) {
-    let message = res.statusText || `Upload failed (${res.status})`;
-    try {
-      const body = await res.json();
-      message = body?.detail ?? message;
-    } catch {
-      // response wasn't JSON
-    }
-    throw new ApiError(res.status, message);
+export async function getResearchReport(threadId: string): Promise<ReportResponse> {
+  const response = await requestJson<ReportResponse>(
+    researchPath(threadId, "/report"),
+  );
+
+  if (typeof response?.report !== "string") {
+    throw new ApiClientError(200, "The research service returned an invalid report.");
   }
-
-  return (await res.json()) as DocumentUploadResponse;
-}
-
-export function sendDocumentChat(documentId: string, message: string) {
-  return request<DocumentChatResponse>(`/documents/${documentId}/chat`, {
-    method: "POST",
-    body: JSON.stringify({ message }),
-  });
-}
-
-export function getDocumentChatHistory(documentId: string) {
-  return request<DocumentHistoryItem[]>(`/documents/${documentId}/chat/history`);
+  return response;
 }
