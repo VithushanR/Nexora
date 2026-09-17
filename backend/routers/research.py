@@ -1,10 +1,4 @@
-"""Authenticated research-pipeline HTTP endpoints.
-
-Part D must replace ``get_current_user_dependency`` with its real
-``get_current_user`` dependency. The dependency result must expose an ``id``
-attribute. Until then, the endpoints intentionally reject requests rather
-than fabricating an authenticated user.
-"""
+"""JWT-authenticated research-pipeline HTTP endpoints."""
 
 from __future__ import annotations
 
@@ -19,6 +13,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, StrictInt
 from langgraph.types import Command
 
+from backend.auth.jwt import get_current_user
 from backend.research_threads import (
     create_thread,
     get_thread,
@@ -124,14 +119,6 @@ class ResearchStartRateLimiter:
 _start_rate_limiter = ResearchStartRateLimiter()
 
 
-async def get_current_user_dependency() -> Any:
-    """Temporary Part D seam; intentionally does not authenticate anyone."""
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="Authentication is not configured.",
-    )
-
-
 @asynccontextmanager
 async def graph_context() -> AsyncIterator[Any]:
     """Lazily load graph dependencies after the FastAPI app has started.
@@ -145,20 +132,9 @@ async def graph_context() -> AsyncIterator[Any]:
         yield app
 
 
-def _current_user_id(current_user: Any) -> str:
-    user_id = getattr(current_user, "id", None)
-    if user_id is None:
-        logger.error("Part D user dependency did not provide an id attribute.")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Authentication user identity is unavailable.",
-        )
-    return str(user_id)
-
-
-async def _owned_thread_or_404(thread_id: str, current_user: Any):
+async def _owned_thread_or_404(thread_id: str, user_id: str):
     thread = await get_thread(thread_id)
-    if thread is None or not await verify_thread_owner(thread_id, _current_user_id(current_user)):
+    if thread is None or not await verify_thread_owner(thread_id, user_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Research thread not found.")
     return thread
 
@@ -230,9 +206,8 @@ async def _resume_research(thread_id: str, selected_indices: list[int]) -> None:
 @router.post("", response_model=ResearchStartResponse, status_code=status.HTTP_201_CREATED)
 async def start_research(
     request: ResearchStartRequest,
-    current_user: Any = Depends(get_current_user_dependency),
+    user_id: str = Depends(get_current_user),
 ) -> ResearchStartResponse:
-    user_id = _current_user_id(current_user)
     if not await _start_rate_limiter.allow(user_id):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -260,8 +235,8 @@ async def start_research(
 
 
 @router.get("/{thread_id}/status", response_model=ResearchStatusResponse)
-async def research_status(thread_id: str, current_user: Any = Depends(get_current_user_dependency)) -> ResearchStatusResponse:
-    thread = await _owned_thread_or_404(thread_id, current_user)
+async def research_status(thread_id: str, user_id: str = Depends(get_current_user)) -> ResearchStatusResponse:
+    thread = await _owned_thread_or_404(thread_id, user_id)
     return ResearchStatusResponse(
         status=thread.status,
         detail=_STATUS_DETAILS[thread.status],
@@ -269,8 +244,8 @@ async def research_status(thread_id: str, current_user: Any = Depends(get_curren
 
 
 @router.get("/{thread_id}/candidates", response_model=CandidatesResponse)
-async def research_candidates(thread_id: str, current_user: Any = Depends(get_current_user_dependency)) -> CandidatesResponse:
-    thread = await _owned_thread_or_404(thread_id, current_user)
+async def research_candidates(thread_id: str, user_id: str = Depends(get_current_user)) -> CandidatesResponse:
+    thread = await _owned_thread_or_404(thread_id, user_id)
     if thread.status != "paused_for_selection":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -290,9 +265,9 @@ async def select_papers(
     thread_id: str,
     request: SelectionRequest,
     background_tasks: BackgroundTasks,
-    current_user: Any = Depends(get_current_user_dependency),
+    user_id: str = Depends(get_current_user),
 ) -> SelectionResponse:
-    thread = await _owned_thread_or_404(thread_id, current_user)
+    thread = await _owned_thread_or_404(thread_id, user_id)
     if thread.status != "paused_for_selection":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -310,8 +285,8 @@ async def select_papers(
 
 
 @router.get("/{thread_id}/report", response_model=ReportResponse)
-async def research_report(thread_id: str, current_user: Any = Depends(get_current_user_dependency)) -> ReportResponse:
-    thread = await _owned_thread_or_404(thread_id, current_user)
+async def research_report(thread_id: str, user_id: str = Depends(get_current_user)) -> ReportResponse:
+    thread = await _owned_thread_or_404(thread_id, user_id)
     if thread.status != "done":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Research report not found.")
 

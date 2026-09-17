@@ -9,12 +9,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from backend.auth.jwt import create_access_token, get_current_user
 from backend.routers import research
-
-
-@dataclass
-class FakeUser:
-    id: str
 
 
 @dataclass
@@ -132,7 +128,7 @@ def router_environment(monkeypatch):
 
     app = FastAPI()
     app.include_router(research.router)
-    app.dependency_overrides[research.get_current_user_dependency] = lambda: FakeUser("owner-1")
+    app.dependency_overrides[get_current_user] = lambda: "owner-1"
     return SimpleNamespace(app=app, threads=threads, updates=updates, graph=graph)
 
 
@@ -168,14 +164,31 @@ def test_start_research_graph_failure_marks_error_without_leaking_exception(rout
     assert next(iter(router_environment.threads.values())).status == "error"
 
 
-def test_default_authentication_seam_rejects_requests(router_environment):
+def test_missing_bearer_token_is_rejected(router_environment):
     router_environment.app.dependency_overrides.clear()
 
     with _client(router_environment) as client:
         response = client.post("/research", json={"domain": "Climate adaptation"})
 
-    assert response.status_code == 503
-    assert response.json()["detail"] == "Authentication is not configured."
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Not authenticated"
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_real_jwt_supplies_string_user_id_to_research_router(router_environment):
+    router_environment.app.dependency_overrides.clear()
+    token = create_access_token("jwt-owner")
+
+    with _client(router_environment) as client:
+        response = client.post(
+            "/research",
+            json={"domain": "Climate adaptation"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 201
+    thread_id = response.json()["thread_id"]
+    assert router_environment.threads[thread_id].user_id == "jwt-owner"
 
 
 def test_status_returns_safe_metadata_detail(router_environment):
