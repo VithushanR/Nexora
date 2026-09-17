@@ -17,6 +17,9 @@ pydantic
 pydantic-settings
 python-dotenv
 reportlab
+PyJWT
+python-multipart
+cryptography
 
 # --- dev / test ---
 pytest
