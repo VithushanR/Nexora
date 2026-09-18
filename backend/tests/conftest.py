@@ -20,3 +20,4 @@ load_dotenv()
 
 os.environ.setdefault("CONTACT_EMAIL", "tests@nexora.local")
 os.environ.setdefault("OPENALEX_MAILTO", "tests@nexora.local")
+os.environ.setdefault("JWT_SECRET_KEY", "nexora-test-only-jwt-secret")

@@ -1,6 +1,8 @@
 fastapi
 uvicorn[standard]
 langgraph
+langgraph-checkpoint-sqlite
+aiosqlite
 langchain-google-genai
 google-genai
 httpx
@@ -17,6 +19,9 @@ pydantic
 pydantic-settings
 python-dotenv
 reportlab
+PyJWT
+python-multipart
+cryptography
 
 # --- dev / test ---
 pytest
