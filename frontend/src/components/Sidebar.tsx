@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { getAuthToken, setAuthToken, clearAuthToken } from "../api/client";
+import { useAuth } from "../auth/AuthContext";
+import GoogleSignInButton from "../auth/GoogleSignInButton";
 
 interface HistoryEntry {
   threadId: string;
@@ -26,10 +27,13 @@ export function addHistory(threadId: string, domain: string) {
 export default function Sidebar() {
   const location = useLocation();
   const navigate = useNavigate();
+  const { status, user, signOut } = useAuth();
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [tokenOpen, setTokenOpen] = useState(false);
-  const [tokenInput, setTokenInput] = useState(getAuthToken() ?? "");
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const history = getHistory();
+
+  const accountLabel = user?.name || user?.email || "Signed in";
+  const accountInitial = accountLabel.charAt(0).toUpperCase();
 
   const isHome = location.pathname === "/";
 
@@ -138,55 +142,51 @@ export default function Sidebar() {
         </Link>
       </nav>
 
-      {/* Bottom section */}
+      {/* Bottom section: account */}
       <div className="border-t border-slate-200 px-3 py-3">
-        <div className="relative">
-          <button
-            onClick={() => setTokenOpen((v) => !v)}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50"
-          >
-            <div className="flex h-7 w-7 items-center justify-center rounded-full bg-blue-100 text-xs font-semibold text-blue-700">
-              J
-            </div>
-            <span className="flex-1 truncate text-left">Janeesha</span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-              <path d="M7 10l5-5 5 5M7 14l5 5 5-5" />
-            </svg>
-          </button>
+        {status === "signed-in" ? (
+          <div className="relative">
+            <button
+              onClick={() => setAccountMenuOpen((v) => !v)}
+              className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50"
+            >
+              {user?.picture ? (
+                <img
+                  src={user.picture}
+                  alt=""
+                  referrerPolicy="no-referrer"
+                  className="h-7 w-7 rounded-full object-cover"
+                />
+              ) : (
+                <div className="flex h-7 w-7 items-center justify-center rounded-full bg-blue-100 text-xs font-semibold text-blue-700">
+                  {accountInitial}
+                </div>
+              )}
+              <span className="flex-1 truncate text-left">{accountLabel}</span>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M7 10l5-5 5 5M7 14l5 5 5-5" />
+              </svg>
+            </button>
 
-          {tokenOpen && (
-            <div className="absolute bottom-full left-0 mb-2 w-full rounded-xl border border-slate-200 bg-white p-3 shadow-lg">
-              <p className="mb-2 text-xs text-slate-500">API token for testing</p>
-              <input
-                value={tokenInput}
-                onChange={(e) => setTokenInput(e.target.value)}
-                placeholder="eyJhbGciOi..."
-                className="mb-2 w-full rounded-md border border-slate-200 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
-              />
-              <div className="flex gap-2">
+            {accountMenuOpen && (
+              <div className="absolute bottom-full left-0 mb-2 w-full rounded-xl border border-slate-200 bg-white p-1.5 shadow-lg">
                 <button
                   onClick={() => {
-                    setAuthToken(tokenInput);
-                    setTokenOpen(false);
+                    signOut();
+                    setAccountMenuOpen(false);
                   }}
-                  className="flex-1 rounded-md bg-blue-600 px-2 py-1.5 text-xs font-medium text-white hover:bg-blue-700"
+                  className="w-full rounded-md px-3 py-2 text-left text-sm text-slate-600 hover:bg-slate-50"
                 >
-                  Save
-                </button>
-                <button
-                  onClick={() => {
-                    clearAuthToken();
-                    setTokenInput("");
-                    setTokenOpen(false);
-                  }}
-                  className="flex-1 rounded-md border border-slate-200 px-2 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
-                >
-                  Clear
+                  Sign out
                 </button>
               </div>
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        ) : (
+          <div className="flex justify-center px-1">
+            <GoogleSignInButton width={210} />
+          </div>
+        )}
       </div>
     </aside>
   );

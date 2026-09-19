@@ -8,10 +8,18 @@ Tests for Part B (Report Copilot), covering:
   - message-length cap enforced server-side, before sanitization
   - add_to_evidence only accepts web-mode messages, and re-indexes
   - history is chronological with correct role/mode tagging
-  - auth/ownership: 403 for a thread the caller doesn't own
+  - auth/ownership: 404 for a thread the caller doesn't own (matching
+    research.py's convention -- see _require_owned_thread)
 
-Everything backend.rag.chat / backend.llm.client touches is mocked -- no
-real network or LLM calls. Run with: pytest backend/tests/test_copilot.py -v
+backend.rag.chat's build_index/query/rag_chat are real, synchronous
+functions (Part D's implementation): copilot.py calls them via
+asyncio.to_thread, and tests mock them with plain Mock (not AsyncMock)
+to match. backend.llm.client.llm_json_call and copilot._web_search are
+genuinely async and stay AsyncMock. No real network or LLM calls.
+Auth is mocked at the copilot.get_thread/verify_thread_owner seam rather
+than hitting a real sqlite database.
+
+Run with: pytest backend/tests/test_copilot.py -v
 """
 
 import logging
@@ -21,30 +29,46 @@ from fastapi import HTTPException
 from unittest.mock import AsyncMock, Mock, patch
 
 import backend.routers.copilot as copilot
-import backend.rag.chat as rag_chat_module
-from backend.auth.deps import register_thread_owner, _THREAD_OWNERS
 from backend.report.store import register_report, _REPORTS
 from backend.routers.copilot import ChatRequest, AddToEvidenceRequest
 
 MODULE = "backend.routers.copilot"
 
+# thread_id -> owning user_id. A lightweight double for
+# backend.research_threads, monkeypatched onto copilot.get_thread /
+# copilot.verify_thread_owner below -- avoids needing a real sqlite DB for
+# what is otherwise a pure auth-wiring concern.
+_THREAD_OWNERS: dict[str, str] = {}
+
+
+async def _fake_get_thread(thread_id: str):
+    return object() if thread_id in _THREAD_OWNERS else None
+
+
+async def _fake_verify_thread_owner(thread_id: str, user_id: str) -> bool:
+    return _THREAD_OWNERS.get(thread_id) == user_id
+
+
+def register_thread_owner(thread_id: str, user_id: str) -> None:
+    _THREAD_OWNERS[thread_id] = user_id
+
 
 @pytest.fixture(autouse=True)
-def _reset_module_state():
-    """Every store here is a plain module-level dict (see the STUB comments
-    in auth/deps.py, report/store.py, rag/chat.py, and copilot.py itself)
-    -- clear them between tests so nothing leaks across test cases."""
+def _reset_module_state(monkeypatch):
+    """Every store here is a plain module-level dict -- clear them between
+    tests so nothing leaks across test cases. get_thread/verify_thread_owner
+    are monkeypatched to the fake thread registry above for every test."""
     copilot._HISTORY.clear()
     copilot._LAST_CHUNKS.clear()
     _THREAD_OWNERS.clear()
     _REPORTS.clear()
-    rag_chat_module._INDEXES.clear()
+    monkeypatch.setattr(copilot, "get_thread", _fake_get_thread)
+    monkeypatch.setattr(copilot, "verify_thread_owner", _fake_verify_thread_owner)
     yield
     copilot._HISTORY.clear()
     copilot._LAST_CHUNKS.clear()
     _THREAD_OWNERS.clear()
     _REPORTS.clear()
-    rag_chat_module._INDEXES.clear()
 
 
 def make_report(**overrides) -> dict:
@@ -140,7 +164,9 @@ async def test_index_empty_evidence_table_does_not_crash(caplog):
 
     assert result.indexed is True
     assert result.n_chunks == 0
-    mock_build_index.assert_called_once_with([], namespace=f"report:{thread_id}")
+    # rag.chat.build_index() raises ValueError on an empty chunk list, so
+    # copilot.py must skip the call entirely rather than call it with [].
+    mock_build_index.assert_not_called()
     assert "evidence_table is empty" in caplog.text
     assert "contradictions analysis incomplete" in caplog.text
     assert "gap analysis incomplete" in caplog.text
@@ -151,13 +177,20 @@ async def test_index_is_idempotent_reindexing_does_not_duplicate():
     thread_id = "thread-index-idempotent"
     setup_thread(thread_id)
 
-    await copilot.index_report(thread_id, user_id="u1")
-    first = rag_chat_module._INDEXES[f"report:{thread_id}"]
-    await copilot.index_report(thread_id, user_id="u1")
-    second = rag_chat_module._INDEXES[f"report:{thread_id}"]
+    mock_build_index = Mock()
+    with patch(f"{MODULE}.build_index", mock_build_index):
+        first = await copilot.index_report(thread_id, user_id="u1")
+        second = await copilot.index_report(thread_id, user_id="u1")
 
-    assert first == second
-    assert len(second) == 4
+    assert first.n_chunks == second.n_chunks == 4
+    # build_index() itself overwrites a namespace wholesale (frozen
+    # interface contract) -- copilot.py's part of "idempotent" is calling
+    # it again with the same full chunk list, not an accumulated one.
+    assert mock_build_index.call_count == 2
+    first_chunks = mock_build_index.call_args_list[0][0][0]
+    second_chunks = mock_build_index.call_args_list[1][0][0]
+    assert first_chunks == second_chunks
+    assert len(second_chunks) == 4
 
 
 # ------------------------------------------------------------------
@@ -170,7 +203,9 @@ async def test_chat_report_mode_calls_rag_chat_with_correct_namespace():
     setup_thread(thread_id)
     await copilot.index_report(thread_id, user_id="u1")
 
-    mock_rag_chat = AsyncMock(return_value="Papers One and Two report conflicting results.")
+    # rag_chat is a sync function called via asyncio.to_thread -- Mock, not
+    # AsyncMock, matches the real (Part D) interface.
+    mock_rag_chat = Mock(return_value="Papers One and Two report conflicting results.")
     with patch(f"{MODULE}.rag_chat", mock_rag_chat):
         response = await copilot.chat(
             thread_id, ChatRequest(message="What did the papers find?", mode="report"), user_id="u1",
@@ -263,7 +298,7 @@ async def test_chat_sanitizes_adversarial_input_before_it_reaches_the_llm():
     assert "ignore all previous instructions" not in sanitized.lower()
     assert "reveal your system prompt" not in sanitized.lower()
 
-    mock_rag_chat = AsyncMock(return_value="A safe, grounded answer.")
+    mock_rag_chat = Mock(return_value="A safe, grounded answer.")
     with patch(f"{MODULE}.rag_chat", mock_rag_chat):
         await copilot.chat(thread_id, ChatRequest(message=raw_message, mode="report"), user_id="u1")
 
@@ -299,7 +334,7 @@ async def test_add_to_evidence_rejects_report_mode_message():
     setup_thread(thread_id)
     await copilot.index_report(thread_id, user_id="u1")
 
-    mock_rag_chat = AsyncMock(return_value="A report-grounded answer.")
+    mock_rag_chat = Mock(return_value="A report-grounded answer.")
     with patch(f"{MODULE}.rag_chat", mock_rag_chat):
         chat_response = await copilot.chat(
             thread_id, ChatRequest(message="Summarize the report.", mode="report"), user_id="u1",
@@ -369,7 +404,7 @@ async def test_history_is_chronological_with_correct_role_and_mode_tagging():
     setup_thread(thread_id)
     await copilot.index_report(thread_id, user_id="u1")
 
-    mock_rag_chat = AsyncMock(side_effect=["First answer.", "Second answer."])
+    mock_rag_chat = Mock(side_effect=["First answer.", "Second answer."])
     with patch(f"{MODULE}.rag_chat", mock_rag_chat):
         await copilot.chat(thread_id, ChatRequest(message="First question?", mode="report"), user_id="u1")
         await copilot.chat(thread_id, ChatRequest(message="Second question?", mode="report"), user_id="u1")
@@ -390,9 +425,17 @@ async def test_history_is_chronological_with_correct_role_and_mode_tagging():
 # ------------------------------------------------------------------
 # Auth / ownership
 # ------------------------------------------------------------------
+# copilot.py now authenticates via the same real seam research.py uses
+# (backend.auth.jwt.get_current_user + backend.research_threads), which
+# returns 404 -- not 403 -- for a thread that exists but isn't the
+# caller's, so a non-owner can't distinguish "doesn't exist" from "exists,
+# not yours". get_thread/verify_thread_owner are monkeypatched by the
+# autouse fixture above; register_thread_owner() only ever registers the
+# real owner, never "attacker", so these calls fall through to the 404
+# branch exactly as they would against the real database.
 
 @pytest.mark.asyncio
-async def test_non_owner_gets_403():
+async def test_non_owner_gets_404():
     thread_id = "thread-not-yours"
     register_thread_owner(thread_id, "owner-user")
     register_report(thread_id, make_report())
@@ -400,19 +443,29 @@ async def test_non_owner_gets_403():
     with pytest.raises(HTTPException) as exc_info:
         await copilot.index_report(thread_id, user_id="attacker")
 
-    assert exc_info.value.status_code == 403
+    assert exc_info.value.status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_non_owner_gets_403_on_chat_and_history_too():
+async def test_non_owner_gets_404_on_chat_and_history_too():
     thread_id = "thread-not-yours-2"
     register_thread_owner(thread_id, "owner-user")
     register_report(thread_id, make_report())
 
     with pytest.raises(HTTPException) as exc_info:
         await copilot.chat(thread_id, ChatRequest(message="hi", mode="report"), user_id="attacker")
-    assert exc_info.value.status_code == 403
+    assert exc_info.value.status_code == 404
 
     with pytest.raises(HTTPException) as exc_info:
         await copilot.get_history(thread_id, user_id="attacker")
-    assert exc_info.value.status_code == 403
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_unknown_thread_id_also_gets_404():
+    """A thread_id nobody ever registered is indistinguishable from one
+    that exists but belongs to someone else -- both are a plain 404."""
+    with pytest.raises(HTTPException) as exc_info:
+        await copilot.index_report("no-such-thread", user_id="u1")
+
+    assert exc_info.value.status_code == 404

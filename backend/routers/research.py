@@ -166,16 +166,16 @@ def _checkpointed_candidates(snapshot: Any) -> list[dict[str, Any]]:
 def _validate_selected_indices(selected_indices: list[int], candidate_count: int) -> None:
     """Mirror human_selection_node validation before a background resume."""
     if not selected_indices:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="At least one candidate must be selected.")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="At least one candidate must be selected.")
 
     seen: set[int] = set()
     for index in selected_indices:
         if isinstance(index, bool) or not isinstance(index, int):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Each selected index must be an integer.")
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Each selected index must be an integer.")
         if index < 0 or index >= candidate_count:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Selected index is outside the candidate range.")
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Selected index is outside the candidate range.")
         if index in seen:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Selected indices must be unique.")
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Selected indices must be unique.")
         seen.add(index)
 
 

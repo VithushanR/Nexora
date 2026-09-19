@@ -117,14 +117,14 @@ OPENALEX_MAILTO=you@example.com
 Create a `.env` file in `frontend/`:
 
 ```env
-VITE_API_BASE_URL=http://localhost:8000
+VITE_API_BASE_URL=http://localhost:8001
 ```
 
 ### Running locally
 
 ```bash
-uvicorn app.main:app --reload    # backend
-cd frontend && npm run dev       # frontend, separate terminal
+uvicorn backend.main:app --reload --port 8001   # backend
+cd frontend && npm run dev                      # frontend, separate terminal
 ```
 
 ## Responsible AI

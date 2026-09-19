@@ -4,17 +4,15 @@ FastAPI application entrypoint.
 Responsibility:
 - Instantiate the FastAPI app.
 - Configure CORS so the Vite frontend (localhost:5173 or VITE origin) can call the API.
-- Mount the search, selection, and chat routers.
+- Mount the research, copilot, documents, and auth routers.
 - Wire up startup/shutdown hooks (e.g. checkpointer/db init) if needed.
 """
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import get_settings
-from routers import search, selection, chat, copilot
 from backend.config import get_settings
-from backend.routers import chat, research, search, selection
+from backend.routers import auth, copilot, documents, research
 
 # TODO: read allowed origins from config instead of hardcoding
 settings = get_settings()
@@ -30,12 +28,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# TODO: mount routers once implemented
-app.include_router(search.router)
-app.include_router(selection.router)
-app.include_router(chat.router)
-app.include_router(copilot.router)
 app.include_router(research.router)
+app.include_router(copilot.router)
+app.include_router(documents.router)
+app.include_router(auth.router)
 
 
 @app.get("/health")

@@ -10,7 +10,7 @@ interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
-  mode?: "report" | "web";
+  mode?: "report" | "web" | null;
   sources?: CopilotChatResponse["sources"];
   added?: boolean;
 }

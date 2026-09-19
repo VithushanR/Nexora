@@ -3,6 +3,14 @@
 
 import type {
   CandidatesResponse,
+  CopilotAddToEvidenceResponse,
+  CopilotChatMode,
+  CopilotChatResponse,
+  CopilotHistoryEntry,
+  CopilotIndexResponse,
+  DocumentChatHistoryEntry,
+  DocumentChatResponse,
+  DocumentUploadResponse,
   ResearchStartRequest,
   ResearchStartResponse,
   ResearchStatusResponse,
@@ -15,7 +23,18 @@ export type AuthHeadersProvider = () => Promise<Record<string, string>>;
 
 let authHeadersProvider: AuthHeadersProvider | undefined;
 
-export class ApiClientError extends Error {
+// Common base so callers that don't care about the specific failure mode
+// (upload widgets, chat panels) can do a single `e instanceof ApiError`
+// check, while call sites that DO care about status-code specifics
+// (SelectionPage, ReportPage) keep narrowing to ApiClientError etc.
+export class ApiError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+export class ApiClientError extends ApiError {
   constructor(
     public readonly status: number,
     message: string,
@@ -25,14 +44,14 @@ export class ApiClientError extends Error {
   }
 }
 
-export class ApiConfigurationError extends Error {
+export class ApiConfigurationError extends ApiError {
   constructor(message: string) {
     super(message);
     this.name = "ApiConfigurationError";
   }
 }
 
-export class ApiNetworkError extends Error {
+export class ApiNetworkError extends ApiError {
   constructor(message: string) {
     super(message);
     this.name = "ApiNetworkError";
@@ -42,6 +61,92 @@ export class ApiNetworkError extends Error {
 export function setAuthHeadersProvider(provider?: AuthHeadersProvider): void {
   authHeadersProvider = provider;
 }
+
+// ---------------------------------------------------------------------------
+// Auth token storage. Google Sign-In (src/auth/AuthContext.tsx) posts the
+// Google ID token to POST /auth/google and stores the app JWT it returns
+// using these functions.
+// ---------------------------------------------------------------------------
+
+const AUTH_TOKEN_STORAGE_KEY = "nexora_auth_token";
+
+export function getAuthToken(): string | null {
+  try {
+    return localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setAuthToken(token: string): void {
+  try {
+    localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+  } catch {
+    // localStorage unavailable (private browsing, disabled storage, etc.)
+    // -- the token just won't persist across reloads.
+  }
+}
+
+export function clearAuthToken(): void {
+  try {
+    localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Signed-in user display info. POST /auth/google only returns the app JWT
+// (no name/email/picture -- see backend/routers/auth.py's GoogleLoginResponse),
+// so AuthContext decodes those fields from the Google ID token payload at
+// sign-in time and stores them here for display (avatar initial, name, etc.).
+// ---------------------------------------------------------------------------
+
+export interface AuthUser {
+  name: string | null;
+  email: string | null;
+  picture: string | null;
+}
+
+const AUTH_USER_STORAGE_KEY = "nexora_auth_user";
+
+export function getAuthUser(): AuthUser | null {
+  try {
+    const raw = localStorage.getItem(AUTH_USER_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as AuthUser) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setAuthUser(user: AuthUser): void {
+  try {
+    localStorage.setItem(AUTH_USER_STORAGE_KEY, JSON.stringify(user));
+  } catch {
+    // ignore -- same non-fatal storage failure as setAuthToken()
+  }
+}
+
+export function clearAuthUser(): void {
+  try {
+    localStorage.removeItem(AUTH_USER_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+// Attach the stored token to every outgoing request as a Bearer token.
+// setAuthHeadersProvider() only ever registers a hook -- without actually
+// calling it here, a token saved via setAuthToken() would never reach the
+// backend on any request.
+setAuthHeadersProvider(async () => {
+  const token = getAuthToken();
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  return headers;
+});
 
 function getBaseUrl(): string {
   const configuredUrl = import.meta.env.VITE_API_BASE_URL?.trim();
@@ -103,6 +208,23 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
   return payload as T;
 }
 
+// ---------------------------------------------------------------------------
+// Google Sign-In (backend/routers/auth.py). Request/response shape matches
+// that router's GoogleLoginRequest/GoogleLoginResponse exactly.
+// ---------------------------------------------------------------------------
+
+export interface GoogleLoginResponse {
+  access_token: string;
+  token_type: string;
+}
+
+export async function loginWithGoogle(idToken: string): Promise<GoogleLoginResponse> {
+  return requestJson<GoogleLoginResponse>("/auth/google", {
+    method: "POST",
+    body: JSON.stringify({ id_token: idToken }),
+  });
+}
+
 export async function startResearch(
   request: ResearchStartRequest,
 ): Promise<ResearchStartResponse> {
@@ -154,4 +276,108 @@ export async function getResearchReport(threadId: string): Promise<ReportRespons
     throw new ApiClientError(200, "The research service returned an invalid report.");
   }
   return response;
+}
+
+// ---------------------------------------------------------------------------
+// Report Copilot (backend/routers/copilot.py). Response shapes match that
+// router's Pydantic models exactly -- see types/index.ts.
+// ---------------------------------------------------------------------------
+
+export async function indexCopilot(threadId: string): Promise<CopilotIndexResponse> {
+  return requestJson<CopilotIndexResponse>(researchPath(threadId, "/copilot/index"), {
+    method: "POST",
+  });
+}
+
+export async function sendCopilotMessage(
+  threadId: string,
+  message: string,
+  mode: CopilotChatMode,
+): Promise<CopilotChatResponse> {
+  return requestJson<CopilotChatResponse>(researchPath(threadId, "/copilot/chat"), {
+    method: "POST",
+    body: JSON.stringify({ message, mode }),
+  });
+}
+
+export async function addToEvidence(
+  threadId: string,
+  messageId: string,
+): Promise<CopilotAddToEvidenceResponse> {
+  return requestJson<CopilotAddToEvidenceResponse>(
+    researchPath(threadId, "/copilot/add_to_evidence"),
+    {
+      method: "POST",
+      body: JSON.stringify({ message_id: messageId }),
+    },
+  );
+}
+
+export async function getCopilotHistory(threadId: string): Promise<CopilotHistoryEntry[]> {
+  return requestJson<CopilotHistoryEntry[]>(researchPath(threadId, "/copilot/history"));
+}
+
+// ---------------------------------------------------------------------------
+// Document upload + single-paper chat (backend/routers/documents.py).
+// Response shapes match that router's plain-dict returns exactly -- note
+// this is a genuinely different contract from Copilot above (no "mode",
+// page-level sources instead of evidence_row/web-typed ones), so these are
+// deliberately separate functions rather than one shared "chat" helper.
+// ---------------------------------------------------------------------------
+
+function documentPath(documentId: string, suffix = ""): string {
+  return `/documents/${encodeURIComponent(documentId)}${suffix}`;
+}
+
+export async function uploadDocument(file: File): Promise<DocumentUploadResponse> {
+  const authHeaders = authHeadersProvider ? await authHeadersProvider() : {};
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(authHeaders)) {
+    headers.set(name, value);
+  }
+  // Deliberately not using requestJson(): it force-sets
+  // Content-Type: application/json, which would break the multipart
+  // boundary the browser needs to set itself for FormData uploads.
+  const formData = new FormData();
+  formData.append("file", file);
+
+  let response: Response;
+  try {
+    response = await fetch(`${getBaseUrl()}/documents/upload`, {
+      method: "POST",
+      headers,
+      body: formData,
+    });
+  } catch {
+    throw new ApiNetworkError("Unable to connect to the research service.");
+  }
+
+  const payload = await parseJson(response);
+  if (!response.ok) {
+    throw new ApiClientError(
+      response.status,
+      responseDetail(payload, "The document could not be uploaded."),
+    );
+  }
+  return payload as DocumentUploadResponse;
+}
+
+export async function sendDocumentChat(
+  documentId: string,
+  message: string,
+): Promise<DocumentChatResponse> {
+  return requestJson<DocumentChatResponse>(documentPath(documentId, "/chat"), {
+    method: "POST",
+    body: JSON.stringify({ message }),
+  });
+}
+
+export async function getDocumentChatHistory(
+  documentId: string,
+): Promise<DocumentChatHistoryEntry[]> {
+  return requestJson<DocumentChatHistoryEntry[]>(documentPath(documentId, "/chat/history"));
+}
+
+export async function deleteDocument(documentId: string): Promise<{ deleted: true }> {
+  return requestJson<{ deleted: true }>(documentPath(documentId), { method: "DELETE" });
 }

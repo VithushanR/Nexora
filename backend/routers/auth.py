@@ -31,9 +31,9 @@ with an audience mismatch inside verify_google_id_token().
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
-from auth.google_auth import verify_google_id_token
-from auth.jwt import create_access_token
-from auth.users import find_or_create_user
+from backend.auth.google_auth import verify_google_id_token
+from backend.auth.jwt import create_access_token
+from backend.auth.users import find_or_create_user
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 

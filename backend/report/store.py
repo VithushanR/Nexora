@@ -1,18 +1,22 @@
-# STUB -- replace with Part D's real implementation. Interface must not change.
 """
-Placeholder per-thread report lookup for backend/routers/copilot.py.
+Per-thread report lookup for backend/routers/copilot.py.
 
-Nothing in this codebase yet persists a finished `report` object keyed by
-thread_id (the pipeline in backend/graph/build_graph.py doesn't have a
-human_selection/report_assembly path wired up end-to-end, and there's no
-DB). This stub keeps Part B runnable and testable in isolation:
-get_report() returns whatever was registered via register_report() for
-that thread_id, falling back to a hardcoded sample report matching the
-Part B contract shape so local testing works without the full pipeline.
+register_report() is called for real by backend/agents/report_assembly.py's
+report_assembly_node, right after it assembles evidence_table/contradictions/
+gaps for a completed research thread -- see that module for the exact field
+mapping (most fields pass through unchanged; gaps get a small rename since
+gap_discovery.py's real shape uses statement/supporting_paper_ids where this
+contract expects theme/supporting_paper_titles).
 
-Replace with a real lookup (DB row / checkpointer state keyed by
-thread_id) once the pipeline persists reports -- keep the get_report(thread_id)
--> dict signature stable.
+get_report() falls back to SAMPLE_REPORT only for a thread_id nothing has
+registered yet -- in practice, a thread that hasn't reached report_assembly
+(still running, or copilot/index called before completion), or local
+testing without running the full pipeline.
+
+This store is still in-memory only (module-level dict, not a DB table) --
+lost on process restart, not shared across worker processes. That part
+remains a real gap if this ever needs to survive across processes; the
+get_report(thread_id) -> dict signature should stay stable regardless.
 """
 
 # The exact report shape Part B (Report Copilot) is contracted to receive.

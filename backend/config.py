@@ -8,8 +8,18 @@ Responsibility:
 """
 
 from functools import lru_cache
+from pathlib import Path
 
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
+
+# Must run before any other backend module reads an env var at import time
+# (backend/auth/jwt.py, backend/auth/google_auth.py, backend/auth/encryption.py,
+# backend/sources/base.py all raise RuntimeError at import if their required
+# var is missing). Anchored to this file's own directory -- not a bare
+# load_dotenv() -- so it finds backend/.env regardless of the process's
+# current working directory (repo root vs. backend/).
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 class Settings(BaseSettings):

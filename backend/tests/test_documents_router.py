@@ -26,7 +26,7 @@ from reportlab.pdfgen import canvas
 
 import routers.documents as documents_module
 from routers.documents import router, UPLOAD_DIR, _get_db
-from auth.jwt import get_current_user
+from backend.auth.jwt import get_current_user
 
 
 # ---------------------------------------------------------------------------
