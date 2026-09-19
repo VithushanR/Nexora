@@ -4,10 +4,12 @@ import SearchPage from "./pages/SearchPage";
 import SelectionPage from "./pages/SelectionPage";
 import ReportPage from "./pages/ReportPage";
 import UploadPage from "./pages/UploadPage";
+import { AuthProvider } from "./auth/AuthContext";
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <AuthProvider>
+      <BrowserRouter>
       <div className="flex h-screen bg-slate-50">
         {/* Mobile sidebar toggle */}
         <button
@@ -40,7 +42,7 @@ export default function App() {
         />
 
         {/* Main content */}
-        <main className="flex-1 overflow-hidden">
+        <main className="flex-1 overflow-y-auto">
           <Routes>
             <Route path="/" element={<SearchPage />} />
             <Route path="/select/:runId" element={<SelectionPage />} />
@@ -50,5 +52,6 @@ export default function App() {
         </main>
       </div>
     </BrowserRouter>
+    </AuthProvider>
   );
 }

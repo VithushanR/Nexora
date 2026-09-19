@@ -295,4 +295,8 @@ def rag_chat(
         model=_GEMINI_MODEL,
         contents=prompt,
     )
-    return response.text
+    # response.text is Optional -- a safety-filtered or otherwise empty
+    # generation returns None. Return an honest fallback rather than letting
+    # None reach a caller (e.g. Pydantic validation in copilot.py) that
+    # expects a str, and never fabricate an answer in its place.
+    return response.text or "Could not generate an answer for this question right now."

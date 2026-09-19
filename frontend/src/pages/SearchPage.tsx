@@ -1,4 +1,4 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import {
@@ -7,9 +7,14 @@ import {
   ApiNetworkError,
   startResearch,
 } from "../api/client";
+import { useAuth } from "../auth/AuthContext";
+import GoogleSignInButton from "../auth/GoogleSignInButton";
 
 function userFacingError(error: unknown): string {
   if (error instanceof ApiClientError) {
+    if (error.status === 401) {
+      return "Your session has expired. Please sign in again to start research.";
+    }
     if (error.status === 503) {
       return "Research sign-in/setup is not configured yet. Please try again after authentication is enabled.";
     }
@@ -35,9 +40,23 @@ function userFacingError(error: unknown): string {
 
 export default function SearchPage() {
   const navigate = useNavigate();
+  const { status, signOut } = useAuth();
   const [domain, setDomain] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [needsSignIn, setNeedsSignIn] = useState(false);
+
+  useEffect(() => {
+    if (status === "signed-in") {
+      setNeedsSignIn(false);
+      setErrorMessage((current) =>
+        current === "Please sign in with Google before starting research." ||
+        current === "Your session has expired. Please sign in again to start research."
+          ? null
+          : current,
+      );
+    }
+  }, [status]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -48,15 +67,27 @@ export default function SearchPage() {
     const trimmedDomain = domain.trim();
     if (!trimmedDomain) {
       setErrorMessage("Please enter a research topic before starting.");
+      setNeedsSignIn(false);
+      return;
+    }
+
+    if (status !== "signed-in") {
+      setErrorMessage("Please sign in with Google before starting research.");
+      setNeedsSignIn(true);
       return;
     }
 
     setErrorMessage(null);
+    setNeedsSignIn(false);
     setIsSubmitting(true);
     try {
       const { thread_id } = await startResearch({ domain: trimmedDomain });
       navigate(`/select/${thread_id}`);
     } catch (error) {
+      if (error instanceof ApiClientError && error.status === 401) {
+        signOut();
+        setNeedsSignIn(true);
+      }
       setErrorMessage(userFacingError(error));
     } finally {
       setIsSubmitting(false);
@@ -93,13 +124,14 @@ export default function SearchPage() {
           </div>
 
           {errorMessage && (
-            <p
+            <div
               id="research-topic-error"
               role="alert"
-              className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800"
+              className="space-y-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800"
             >
-              {errorMessage}
-            </p>
+              <p>{errorMessage}</p>
+              {needsSignIn && <GoogleSignInButton width={210} />}
+            </div>
           )}
 
           {isSubmitting && (

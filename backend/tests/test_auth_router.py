@@ -14,9 +14,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import routers.auth as auth_router_module
-import auth.users as users_module
+import backend.auth.users as users_module
 from routers.auth import router
-from auth.jwt import decode_access_token
+from backend.auth.jwt import decode_access_token
 
 
 @pytest.fixture(autouse=True)

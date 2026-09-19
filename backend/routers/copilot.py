@@ -12,13 +12,16 @@ Responsibility:
 
 Part B's only input is the `report` dict produced by the pipeline (see
 backend/report/store.py for the exact contract shape) -- no other field is
-assumed to exist. Everything this router imports but does not own (RAG
-retrieval, auth, prompt sanitization, report persistence) is either already
-built by a teammate or stubbed here with a loud "STUB -- replace with Part
-D's real implementation" comment at the top of the file; see those files for
-what exactly still needs replacing.
+assumed to exist. Auth (backend.auth.jwt.get_current_user) and thread
+ownership (backend.research_threads.get_thread/verify_thread_owner) are the
+same real, shared implementation backend/routers/research.py uses -- this
+router no longer has its own placeholder auth. RAG retrieval
+(backend.rag.chat) and prompt sanitization (backend.auth.sanitize) are
+Part D's real implementations; report persistence (backend.report.store)
+remains a stub -- see that file for what still needs replacing.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Literal, Optional, Union, cast
@@ -27,11 +30,12 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from backend.auth.deps import get_current_user, require_thread_ownership
+from backend.auth.jwt import get_current_user
 from backend.auth.sanitize import sanitize_for_prompt
 from backend.llm.client import llm_json_call
 from backend.rag.chat import build_index, query, rag_chat
 from backend.report.store import get_report
+from backend.research_threads import get_thread, verify_thread_owner
 
 logger = logging.getLogger("nexora.copilot")
 
@@ -114,6 +118,16 @@ _LAST_CHUNKS: dict[str, list[str]] = {}
 
 def _namespace(thread_id: str) -> str:
     return f"report:{thread_id}"
+
+
+async def _require_owned_thread(thread_id: str, user_id: str) -> None:
+    """Raises 404 (not 403) if the thread doesn't exist or isn't owned by
+    user_id -- matching backend/routers/research.py's _owned_thread_or_404
+    exactly, so a non-owner can't distinguish "doesn't exist" from "exists,
+    not yours"."""
+    thread = await get_thread(thread_id)
+    if thread is None or not await verify_thread_owner(thread_id, user_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Research thread not found.")
 
 
 def _append_history(thread_id: str, entry: HistoryEntry) -> None:
@@ -267,9 +281,12 @@ async def _web_search(search_query: str) -> list[dict]:
 
 
 async def _run_report_mode(namespace: str, question: str) -> tuple[str, list[dict]]:
-    hits = query(namespace, question, top_k=5)
+    # rag.chat's build_index/query/rag_chat are synchronous, blocking calls
+    # (real embedding + disk I/O + a synchronous Gemini request) -- run them
+    # off the event loop rather than blocking every other request.
+    hits = await asyncio.to_thread(query, namespace, question, top_k=5)
     sources = [{"type": "evidence_row", "paper_title": _chunk_title(h.get("text", ""))} for h in hits]
-    answer = await rag_chat(namespace, question)
+    answer = await asyncio.to_thread(rag_chat, namespace, question)
     return answer, sources
 
 
@@ -291,7 +308,7 @@ async def _run_auto_mode(namespace: str, question: str) -> tuple[str, AnswerMode
     context_parts: list[str] = []
 
     if "search_report" in tools:
-        for hit in query(namespace, question, top_k=5):
+        for hit in await asyncio.to_thread(query, namespace, question, top_k=5):
             text = hit.get("text", "")
             sources.append({"type": "evidence_row", "paper_title": _chunk_title(text)})
             context_parts.append(text)
@@ -328,13 +345,18 @@ async def _run_auto_mode(namespace: str, question: str) -> tuple[str, AnswerMode
 
 @router.post("/{thread_id}/copilot/index", response_model=IndexResponse)
 async def index_report(thread_id: str, user_id: str = Depends(get_current_user)) -> IndexResponse:
-    require_thread_ownership(user_id, thread_id)
+    await _require_owned_thread(thread_id, user_id)
 
     report = get_report(thread_id)
     _warn_if_incomplete(thread_id, report)
 
     chunks = chunk_report(report)
-    build_index(chunks, namespace=_namespace(thread_id))
+    # rag.chat.build_index() raises ValueError on an empty list -- indexing
+    # nothing is a no-op here, not an error (see chunk_report's docstring:
+    # an empty/incomplete report is still indexed for whatever real content
+    # it does have, which can legitimately be zero chunks).
+    if chunks:
+        await asyncio.to_thread(build_index, chunks, namespace=_namespace(thread_id))
     _LAST_CHUNKS[thread_id] = chunks
 
     return IndexResponse(indexed=True, n_chunks=len(chunks))
@@ -344,7 +366,7 @@ async def index_report(thread_id: str, user_id: str = Depends(get_current_user))
 async def chat(
     thread_id: str, request: ChatRequest, user_id: str = Depends(get_current_user),
 ) -> ChatResponse:
-    require_thread_ownership(user_id, thread_id)
+    await _require_owned_thread(thread_id, user_id)
 
     if len(request.message) > MAX_MESSAGE_CHARS:
         raise HTTPException(
@@ -383,7 +405,7 @@ async def chat(
 async def add_to_evidence(
     thread_id: str, request: AddToEvidenceRequest, user_id: str = Depends(get_current_user),
 ) -> AddToEvidenceResponse:
-    require_thread_ownership(user_id, thread_id)
+    await _require_owned_thread(thread_id, user_id)
 
     entries = _HISTORY.get(thread_id, [])
     entry = next(
@@ -400,7 +422,7 @@ async def add_to_evidence(
 
     existing_chunks = list(_LAST_CHUNKS.get(thread_id, []))
     existing_chunks.append(entry.content)
-    build_index(existing_chunks, namespace=_namespace(thread_id))
+    await asyncio.to_thread(build_index, existing_chunks, namespace=_namespace(thread_id))
     _LAST_CHUNKS[thread_id] = existing_chunks
 
     return AddToEvidenceResponse(added=True)
@@ -408,5 +430,5 @@ async def add_to_evidence(
 
 @router.get("/{thread_id}/copilot/history", response_model=list[HistoryEntry])
 async def get_history(thread_id: str, user_id: str = Depends(get_current_user)) -> list[HistoryEntry]:
-    require_thread_ownership(user_id, thread_id)
+    await _require_owned_thread(thread_id, user_id)
     return _HISTORY.get(thread_id, [])

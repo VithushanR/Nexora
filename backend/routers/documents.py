@@ -37,10 +37,10 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, status
 from pypdf import PdfReader
 
-from auth.encryption import encrypt_bytes
-from auth.jwt import get_current_user
-from auth.sanitize import sanitize_for_prompt
-from rag.chat import build_index, rag_chat
+from backend.auth.encryption import encrypt_bytes
+from backend.auth.jwt import get_current_user
+from backend.auth.sanitize import sanitize_for_prompt
+from backend.rag.chat import build_index, rag_chat
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -195,7 +195,7 @@ def _delete_rag_index_files(document_id: str) -> None:
     Mirrors the sanitization logic in rag/chat.py's _sanitize_namespace:
     ':' becomes '_', so "document:abc-123" -> "document_abc-123".
     """
-    from rag.chat import _INDEX_STORE_DIR  # local import: internal detail, not part of the frozen public interface
+    from backend.rag.chat import _INDEX_STORE_DIR  # local import: internal detail, not part of the frozen public interface
 
     namespace = _document_namespace(document_id)
     sanitized = re.sub(r"[^a-zA-Z0-9_\-]", "_", namespace)
@@ -233,7 +233,7 @@ async def upload_document(
     content_length = request.headers.get("content-length")
     if content_length is not None and int(content_length) > UPLOAD_MAX_SIZE_BYTES:
         raise HTTPException(
-            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"File exceeds the {UPLOAD_MAX_SIZE_MB}MB upload limit.",
         )
 
@@ -243,7 +243,7 @@ async def upload_document(
     # read regardless of what the header claimed.
     if len(file_bytes) > UPLOAD_MAX_SIZE_BYTES:
         raise HTTPException(
-            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"File exceeds the {UPLOAD_MAX_SIZE_MB}MB upload limit.",
         )
 

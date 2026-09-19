@@ -468,7 +468,7 @@ async def test_node_refuses_to_run_without_a_selection():
 # ------------------------------------------------------------------
 
 from backend.agents.report_assembly import (  # noqa: E402
-    render_evidence_table, render_contradictions, chunk_report,
+    render_evidence_table, render_contradictions,
 )
 from backend.agents.synthesis_integrity import (  # noqa: E402
     CONSUMER_ROW_KEYS, CONSUMER_CONTRADICTION_KEYS, _contradiction_summary,
@@ -530,23 +530,6 @@ def test_rendered_contradiction_is_not_a_dash():
     assert "CNN beats ViT" in markdown
     assert "ViT beats CNN" in markdown
     assert "- —" not in markdown
-
-
-def test_chunks_carry_real_content_to_the_copilot_index():
-    """chunk_report() feeds the FAISS index. If it only gets titles, the
-    chat cannot answer anything about methods, results or conflicts."""
-    chunks = chunk_report({
-        "evidence_table": [make_full_row()],
-        "contradictions": [make_contradiction()],
-        "gaps": [],
-    })
-
-    by_section = {c["section"]: c["text"] for c in chunks}
-    assert "evidence" in by_section
-    assert "conflicts" in by_section, "the contradiction produced no chunk at all"
-    assert "A CNN trained on PlantVillage." in by_section["evidence"]
-    assert "Reports 97% accuracy on PlantVillage." in by_section["evidence"]
-    assert "CNN beats ViT" in by_section["conflicts"]
 
 
 def test_contradiction_summary_stands_alone_without_claims():

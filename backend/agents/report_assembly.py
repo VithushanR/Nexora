@@ -2,15 +2,19 @@
 Report assembly (fan-in node).
 
 Merges Agent 3 (evidence_table, contradictions) + Agent 4 (gaps) into one
-markdown report, then chunks and indexes it for the Copilot chat.
-Makes no LLM calls -- pure data merging and embedding.
+markdown report (for GET /research/{thread_id}/report), and registers the
+same data as a structured dict for the Report Copilot to index (for
+POST /research/{thread_id}/copilot/index) via backend/report/store.py.
+Makes no LLM calls -- pure data merging.
 """
 
+from langgraph.config import get_config
+
 from backend.graph.state import ResearchState
-from backend.agents.gap_discovery import embed
+from backend.report.store import register_report
 
 # ============================================================
-# MERGE
+# MERGE (-> Markdown, for GET /research/{thread_id}/report)
 # ============================================================
 
 
@@ -105,79 +109,74 @@ def render_gaps(gaps):
 
 
 # ============================================================
-# CHUNKING & INDEXING (for Copilot "Report mode" retrieval)
+# STRUCTURED REPORT (-> dict, for POST /research/{thread_id}/copilot/index)
 # ============================================================
+#
+# backend/routers/copilot.py's own chunk_report() reads evidence_table rows
+# and contradictions by their real field names directly -- both already
+# match what synthesis_integrity.py produces verbatim (title/doi/year/
+# source/full_text_available/full_text_strategy/summary_source/
+# methodology_summary/results_summary/retracted/retraction_note for rows;
+# description/paper_a_title/paper_a_claim/paper_b_title/paper_b_claim for
+# contradictions), so those pass straight through unchanged.
+#
+# gaps is the one place the shapes genuinely differ: gap_discovery.py's
+# real output uses "statement" and "supporting_paper_ids" (which, per its
+# own docstring, hold paper TITLES -- Candidate has no separate id field),
+# where copilot.py's chunker expects "theme" and "supporting_paper_titles".
+# Same data, different names -- rename here rather than in either agent.
 
 
-def chunk_report(state: dict) -> list[dict]:
-    """One chunk per evidence row, per contradiction, per gap."""
-    chunks = []
-
-    for i, row in enumerate(state.get("evidence_table") or []):
-        text = " ".join(
-            str(row.get(k, "")) for k in ("title", "method", "finding")
-        ).strip()
-        if text:
-            chunks.append({"id": f"evidence:{i}", "section": "evidence", "text": text})
-
-    for i, item in enumerate(state.get("contradictions") or []):
-        text = str(item.get("summary", "")).strip()
-        if text:
-            chunks.append(
-                {"id": f"conflict:{i}", "section": "conflicts", "text": text}
-            )
-
-    for gap in state.get("gaps") or []:
-        quotes = " ".join(q["text"] for q in gap.get("quotes", []))
-        text = f"{gap['statement']} {quotes}".strip()
-        if text:
-            chunks.append(
-                {"id": gap["gap_id"], "section": "gaps", "text": text}
-            )
-
-    return chunks
+def _map_gap_for_copilot(gap: dict) -> dict:
+    return {
+        "theme": gap.get("statement", ""),
+        "support_count": gap.get("support_count", 0),
+        "supporting_paper_titles": gap.get("supporting_paper_ids") or [],
+    }
 
 
-def build_index(chunks):
-    """Embed each chunk once and build a FAISS index. Reuses embed(), no LLM."""
-    import numpy as np
-    import faiss
-
-    if not chunks:
-        return None
-
-    vectors = np.asarray(embed([c["text"] for c in chunks]), dtype="float32")
-    index = faiss.IndexFlatIP(vectors.shape[1])
-    index.add(vectors)
-    return index
+def build_structured_report(state: dict) -> dict:
+    """Builds the dict backend/report/store.py registers for Copilot
+    indexing, from the same state merge_report() renders to Markdown."""
+    return {
+        "domain": state.get("domain", ""),
+        "evidence_table": state.get("evidence_table") or [],
+        "contradictions": state.get("contradictions") or [],
+        "contradictions_status": state.get("contradictions_status") or {},
+        "gaps": [_map_gap_for_copilot(g) for g in (state.get("gaps") or [])],
+        "gaps_status": state.get("gaps_status") or {},
+    }
 
 
 # ============================================================
 # NODE (the entry point)
 # ============================================================
 
-_index = None
-_chunks: list[dict] = []
-
-
-def get_index():
-    """Handed to the Copilot chat route for Report-mode lookups."""
-    return _index, _chunks
-
 
 async def report_assembly_node(state: ResearchState) -> dict:
     """LangGraph fan-in node. Reads Agent 3 + Agent 4 output, writes report.
 
     Runs after both synthesis_integrity and gap_discovery finish. No LLM.
+
+    Also registers the same evidence_table/contradictions/gaps as a
+    structured report (see build_structured_report()) so the Report
+    Copilot's /index endpoint can index this thread's real output instead
+    of falling back to the placeholder sample report. get_config() reads
+    the thread_id LangGraph is running this node under -- ResearchState
+    itself carries no thread_id field, this is the one place a running
+    node can recover it.
     """
-    global _index, _chunks
+    thread_id = (get_config().get("configurable") or {}).get("thread_id")
+    if not thread_id:
+        raise RuntimeError(
+            "report_assembly_node requires a thread_id in the run config "
+            "(config={'configurable': {'thread_id': ...}}) to register the "
+            "report for Copilot indexing -- see backend/routers/research.py's "
+            "THREAD_CONFIG for how every real run supplies this."
+        )
+    register_report(thread_id, build_structured_report(state))
 
-    report_md = merge_report(state)
-
-    _chunks = chunk_report(state)
-    _index = build_index(_chunks)
-
-    return {"report": report_md}
+    return {"report": merge_report(state)}
 
 
 # ============================================================
