@@ -532,6 +532,47 @@ def test_rendered_contradiction_is_not_a_dash():
     assert "- —" not in markdown
 
 
+def test_evidence_table_cells_escape_pipes_and_newlines():
+    """A stray "|" or newline in paper text would split the markdown row."""
+    markdown = render_evidence_table(
+        [make_full_row(method="norm \\|p\\|_1", finding="line one\nline two | x")]
+    )
+    row = [ln for ln in markdown.splitlines() if ln.startswith("| ")][-1]
+    assert "line one line two \\| x" in row
+    assert "\n" not in row
+
+
+def test_empty_sections_show_the_agents_status_message():
+    """An empty list must explain itself (no full text, etc.) instead of
+    always claiming 'nothing found'."""
+    from backend.agents.report_assembly import render_gaps
+
+    conflicts = render_contradictions(
+        [], {"code": "no_comparable_summaries", "is_error": False,
+             "message": "Only 1 of 6 papers produced usable results summaries."})
+    gaps = render_gaps(
+        [], {"code": "no_statements", "is_error": False,
+             "message": "No limitation statements could be extracted."})
+
+    assert "Only 1 of 6 papers" in conflicts
+    assert "No contradictions detected" not in conflicts
+    assert "No limitation statements could be extracted." in gaps
+
+
+def test_empty_section_with_error_status_is_a_warning():
+    markdown = render_contradictions(
+        [], {"code": "llm_budget_exhausted", "is_error": True,
+             "message": "The LLM quota was exhausted."})
+    assert "> **Warning:** The LLM quota was exhausted." in markdown
+
+
+def test_empty_section_without_status_keeps_the_default_message():
+    from backend.agents.report_assembly import render_gaps
+
+    assert "No contradictions detected." in render_contradictions([])
+    assert "support threshold" in render_gaps([])
+
+
 def test_contradiction_summary_stands_alone_without_claims():
     """Summary is the ONLY field rendered, so it must still say something
     useful when the model returns no per-paper claims."""
