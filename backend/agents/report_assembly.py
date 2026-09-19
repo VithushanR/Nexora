@@ -52,10 +52,38 @@ def merge_report(state: dict) -> str:
         )
 
     parts.append(render_evidence_table(evidence_table or []))
-    parts.append(render_contradictions(contradictions or []))
-    parts.append(render_gaps(gaps or []))
+    parts.append(
+        render_contradictions(contradictions or [], state.get("contradictions_status"))
+    )
+    parts.append(render_gaps(gaps or [], state.get("gaps_status")))
 
     return "\n".join(parts)
+
+
+def _render_empty_section(heading, status, fallback):
+    """Explain WHY a section is empty, using the status the agent recorded.
+
+    An empty list can mean "ran and found nothing" or "could not run" (no
+    full text, embedding/LLM failure). Only the agent's status knows which,
+    so show its message rather than a fixed "nothing found" sentence.
+    """
+    if not status:
+        return f"## {heading}\n\n{fallback}\n"
+
+    message = status.get("message") or fallback
+    if status.get("is_error"):
+        return f"## {heading}\n\n> **Warning:** {message}\n"
+    return f"## {heading}\n\n{message}\n"
+
+
+def _table_cell(value):
+    """Make free text safe inside a markdown table cell.
+
+    Paper text can contain "|" (e.g. norms like \\|p\\|_1) or newlines, either
+    of which would split the row and break the table.
+    """
+    text = " ".join(str(value).split())
+    return text.replace("|", "\\|")
 
 
 def render_evidence_table(rows):
@@ -68,19 +96,21 @@ def render_evidence_table(rows):
     lines.append("| --- | --- | --- |")
 
     for row in rows:
-        title = row.get("title", "—")
-        method = row.get("method", "—")
-        finding = row.get("finding", "—")
+        title = _table_cell(row.get("title", "—"))
+        method = _table_cell(row.get("method", "—"))
+        finding = _table_cell(row.get("finding", "—"))
         lines.append(f"| {title} | {method} | {finding} |")
 
     lines.append("")
     return "\n".join(lines)
 
 
-def render_contradictions(items):
+def render_contradictions(items, status=None):
     """Render Agent 3's contradiction report as markdown."""
     if not items:
-        return "## Conflicts\n\nNo contradictions detected.\n"
+        return _render_empty_section(
+            "Conflicts", status, "No contradictions detected."
+        )
 
     lines = ["## Conflicts\n"]
     for item in items:
@@ -89,10 +119,12 @@ def render_contradictions(items):
     return "\n".join(lines)
 
 
-def render_gaps(gaps):
+def render_gaps(gaps, status=None):
     """Render the Research Gaps section as markdown."""
     if not gaps:
-        return "## Research Gaps\n\nNo recurring gaps met the support threshold.\n"
+        return _render_empty_section(
+            "Research Gaps", status, "No recurring gaps met the support threshold."
+        )
 
     lines = ["## Research Gaps\n"]
     for gap in gaps:
