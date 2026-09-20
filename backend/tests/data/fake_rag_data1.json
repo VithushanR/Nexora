@@ -1,0 +1,58 @@
+{
+  "documents": [
+    {
+      "id": "doc-101",
+      "title": "Solar System Basics",
+      "content": [
+        "Bananas are a good source of potassium.",
+        "The stock market closed higher on Tuesday.",
+        "Jupiter is the largest planet in the solar system."
+      ]
+    },
+    {
+      "id": "doc-102",
+      "title": "Climate Report",
+      "content": [
+        "Global average temperatures rose by 1.2 degrees over the last decade.",
+        "Coastal cities face increased flooding risk from rising sea levels.",
+        "Renewable energy adoption grew by 18% year over year."
+      ]
+    }
+  ],
+  "reports": [
+    {
+      "id": "thread-101",
+      "content": [
+        "Server response time improved after the caching layer was added.",
+        "Database migration completed with zero downtime."
+      ]
+    },
+    {
+      "id": "thread-102",
+      "content": [
+        "Chunk zero from the big report.",
+        "Chunk one from the big report.",
+        "Chunk two from the big report.",
+        "Chunk three from the big report.",
+        "Chunk four from the big report.",
+        "Chunk five from the big report.",
+        "Chunk six from the big report.",
+        "Chunk seven from the big report."
+      ]
+    }
+  ],
+  "overwrite_test": {
+    "old": [
+      "This is the first draft of the summary."
+    ],
+    "new": [
+      "This is the final, corrected summary."
+    ]
+  },
+  "context_join_test": {
+    "chunks": [
+      "First retrieved fact about the topic.",
+      "Second retrieved fact about the topic."
+    ]
+  }
+}
