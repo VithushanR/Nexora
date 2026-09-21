@@ -150,14 +150,21 @@ export default function SelectionPage() {
   }
 
   if (isLoading) {
-    return <main className="mx-auto max-w-3xl p-6 text-slate-700">Loading research status…</main>;
+    return (
+      <main className="mx-auto max-w-3xl p-6">
+        <div className="flex items-center gap-3">
+          <div className="step-spinner" />
+          <p className="text-slate-700 dark:text-slate-300">Loading research status…</p>
+        </div>
+      </main>
+    );
   }
 
   if (loadError) {
     return (
       <main className="mx-auto max-w-3xl space-y-4 p-6">
-        <p role="alert" className="rounded-md bg-red-50 p-4 text-red-800">{loadError}</p>
-        <Link className="text-indigo-700 underline" to="/">Start a new research request</Link>
+        <p role="alert" className="rounded-xl bg-red-50 p-4 text-red-800 dark:bg-red-900/20 dark:text-red-400">{loadError}</p>
+        <Link className="text-violet-600 underline hover:text-violet-500 dark:text-violet-400 dark:hover:text-violet-300" to="/">Start a new research request</Link>
       </main>
     );
   }
@@ -186,13 +193,25 @@ export default function SelectionPage() {
   return (
     <main className="mx-auto max-w-4xl space-y-6 p-6">
       <header>
-        <h1 className="text-3xl font-bold text-slate-900">Select research papers</h1>
-        <p className="mt-2 text-slate-600">Choose the screened papers to use for synthesis.</p>
+        <div className="mb-4 flex items-center gap-2">
+          <img src="/nexora-logo.png" alt="Nexora" className="h-7 w-7 rounded-lg object-cover" />
+          <p className="text-sm font-semibold tracking-wide text-violet-600 dark:text-violet-400">Nexora</p>
+        </div>
+        <h1 className="text-3xl font-bold text-slate-900 dark:text-white">Select research papers</h1>
+        <p className="mt-2 text-slate-600 dark:text-slate-400">Choose the screened papers to use for synthesis.</p>
       </header>
 
-      {isLoadingCandidates ? <p className="text-slate-700">Loading candidate papers…</p> : null}
+      {isLoadingCandidates ? (
+        <div className="flex items-center gap-3">
+          <div className="step-spinner" />
+          <p className="text-slate-700 dark:text-slate-300">Loading candidate papers…</p>
+        </div>
+      ) : null}
+
       {candidates.length === 0 && !isLoadingCandidates ? (
-        <p className="rounded-md bg-amber-50 p-4 text-amber-900">No eligible candidate papers are available for this research session.</p>
+        <p className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-amber-900 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-200">
+          No eligible candidate papers are available for this research session.
+        </p>
       ) : null}
 
       <section aria-label="Candidate papers" className="space-y-4">
@@ -208,22 +227,26 @@ export default function SelectionPage() {
         ))}
       </section>
 
-      <section className="flex flex-wrap items-center gap-4 border-t border-slate-200 pt-4">
-        <p className="text-slate-700" aria-live="polite">
+      <section className="flex flex-wrap items-center gap-4 border-t border-slate-200 pt-4 dark:border-slate-700">
+        <p className="text-slate-700 dark:text-slate-300" aria-live="polite">
           {selectedIndices.length} {selectedIndices.length === 1 ? "paper" : "papers"} selected
         </p>
         <button
           type="button"
           onClick={() => void handleSubmit()}
           disabled={selectedIndices.length === 0 || isSubmitting || isLoadingCandidates}
-          className="rounded-md bg-indigo-600 px-4 py-2 font-medium text-white disabled:cursor-not-allowed disabled:bg-slate-400"
+          className="rounded-xl bg-violet-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-violet-500 active:scale-[0.98] disabled:cursor-not-allowed disabled:bg-slate-300 dark:disabled:bg-slate-700 dark:disabled:text-slate-500"
         >
           {isSubmitting ? "Submitting selection…" : "Submit selection"}
         </button>
-        <Link className="text-indigo-700 underline" to="/">Start new research</Link>
+        <Link className="text-violet-600 underline transition hover:text-violet-500 dark:text-violet-400 dark:hover:text-violet-300" to="/">
+          Start new research
+        </Link>
       </section>
 
-      {submissionError ? <p role="alert" className="rounded-md bg-red-50 p-4 text-red-800">{submissionError}</p> : null}
+      {submissionError ? (
+        <p role="alert" className="rounded-xl bg-red-50 p-4 text-red-800 dark:bg-red-900/20 dark:text-red-400">{submissionError}</p>
+      ) : null}
     </main>
   );
 }
@@ -236,9 +259,19 @@ interface StatusViewProps {
 function StatusView({ message, reportPath }: StatusViewProps) {
   return (
     <main className="mx-auto max-w-3xl space-y-4 p-6">
-      <p className="rounded-md bg-slate-100 p-4 text-slate-800">{message}</p>
-      {reportPath ? <Link className="text-indigo-700 underline" to={reportPath}>View report</Link> : null}
-      <Link className="block text-indigo-700 underline" to="/">Start a new research request</Link>
+      <div className="flex items-center gap-2">
+        <img src="/nexora-logo.png" alt="Nexora" className="h-7 w-7 rounded-lg object-cover" />
+        <p className="text-sm font-semibold tracking-wide text-violet-600 dark:text-violet-400">Nexora</p>
+      </div>
+      <p className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-slate-800 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300">{message}</p>
+      {reportPath ? (
+        <Link className="text-violet-600 underline transition hover:text-violet-500 dark:text-violet-400 dark:hover:text-violet-300" to={reportPath}>
+          View report
+        </Link>
+      ) : null}
+      <Link className="block text-violet-600 underline transition hover:text-violet-500 dark:text-violet-400 dark:hover:text-violet-300" to="/">
+        Start a new research request
+      </Link>
     </main>
   );
 }
