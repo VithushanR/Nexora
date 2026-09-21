@@ -26,3 +26,4 @@ cryptography
 # --- dev / test ---
 pytest
 pytest-asyncio
+pyright
