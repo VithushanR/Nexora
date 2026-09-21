@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import FastAPI
@@ -11,6 +12,13 @@ from fastapi.testclient import TestClient
 
 from backend.auth.jwt import create_access_token, get_current_user
 from backend.routers import research
+from backend.safety.nvidia_client import (
+    NvidiaSafetyClassification,
+    NvidiaSafetyConfigurationError,
+    NvidiaSafetyProviderError,
+    NvidiaSafetyResponseError,
+)
+from backend.safety.policy import SafetyDecision, SafetyPolicyResult
 
 
 @dataclass
@@ -62,6 +70,7 @@ class FakeGraph:
         self.fail_resume = False
         self.report: str | None = "# Completed report"
         self.resume_payloads: list[dict[str, Any]] = []
+        self.start_inputs: list[dict[str, Any]] = []
 
     async def ainvoke(self, input_value, config=None):
         if hasattr(input_value, "resume"):
@@ -72,6 +81,7 @@ class FakeGraph:
             return {"report": self.report}
         if self.fail_start:
             raise RuntimeError("controlled start failure")
+        self.start_inputs.append(input_value)
         return {"__interrupt__": [FakeInterrupt({"kind": "paper_selection"})]}
 
     async def aget_state(self, config):
@@ -92,9 +102,21 @@ def router_environment(monkeypatch):
     updates: list[tuple[str, str]] = []
     graph = FakeGraph()
     next_thread = 0
+    create_calls: list[tuple[str, str]] = []
+    safe_classification = NvidiaSafetyClassification(
+        user_safety="safe",
+        raw_user_safety="safe",
+        categories=(),
+        raw_model_output='{"User Safety": "safe"}',
+    )
+    safety_client = AsyncMock(return_value=safe_classification)
+    safety_policy = Mock(
+        return_value=SafetyPolicyResult(decision=SafetyDecision.SAFE)
+    )
 
     async def fake_create_thread(user_id, domain):
         nonlocal next_thread
+        create_calls.append((str(user_id), domain))
         next_thread += 1
         thread_id = f"thread-{next_thread}"
         threads[thread_id] = FakeThread(thread_id, str(user_id), domain, "running_agent2")
@@ -124,12 +146,23 @@ def router_environment(monkeypatch):
     monkeypatch.setattr(research, "update_thread_status", fake_update_status)
     monkeypatch.setattr(research, "verify_thread_owner", fake_verify_owner)
     monkeypatch.setattr(research, "graph_context", fake_graph_context)
+    monkeypatch.setattr(research, "classify_research_topic", safety_client)
+    monkeypatch.setattr(research, "apply_safety_policy", safety_policy)
     monkeypatch.setattr(research, "_start_rate_limiter", research.ResearchStartRateLimiter())
 
     app = FastAPI()
     app.include_router(research.router)
     app.dependency_overrides[get_current_user] = lambda: "owner-1"
-    return SimpleNamespace(app=app, threads=threads, updates=updates, graph=graph)
+    return SimpleNamespace(
+        app=app,
+        threads=threads,
+        updates=updates,
+        graph=graph,
+        create_calls=create_calls,
+        safety_client=safety_client,
+        safety_policy=safety_policy,
+        safe_classification=safe_classification,
+    )
 
 
 def _client(environment):
@@ -150,6 +183,169 @@ def test_start_research_reaches_selection_and_returns_created_thread(router_envi
     thread_id = response.json()["thread_id"]
     assert router_environment.threads[thread_id].status == "paused_for_selection"
     assert (thread_id, "paused_for_selection") in router_environment.updates
+    router_environment.safety_client.assert_awaited_once_with("Climate adaptation")
+    router_environment.safety_policy.assert_called_once_with(
+        "Climate adaptation", router_environment.safe_classification
+    )
+
+
+@pytest.mark.parametrize(
+    ("decision", "code"),
+    [
+        (SafetyDecision.UNSAFE, "SAFETY_UNSAFE"),
+        (SafetyDecision.UNCERTAIN, "SAFETY_NEEDS_CONTEXT"),
+    ],
+)
+def test_safety_rejection_stops_before_thread_and_graph(
+    router_environment, decision, code
+):
+    router_environment.safety_policy.return_value = SafetyPolicyResult(
+        decision=decision,
+        message="Safe user-facing safety message.",
+    )
+
+    with _client(router_environment) as client:
+        response = client.post("/research", json={"domain": "Original topic"})
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {"code": code, "message": "Safe user-facing safety message."}
+    }
+    router_environment.safety_client.assert_awaited_once_with("Original topic")
+    assert router_environment.create_calls == []
+    assert router_environment.threads == {}
+    assert router_environment.graph.start_inputs == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        NvidiaSafetyProviderError("provider failed with secret test-api-key"),
+        NvidiaSafetyConfigurationError("missing test-api-key"),
+        NvidiaSafetyResponseError("malformed response containing test-api-key"),
+    ],
+)
+def test_safety_service_failure_is_sanitized_and_fail_closed(
+    router_environment, failure
+):
+    router_environment.safety_client.side_effect = failure
+
+    with _client(router_environment) as client:
+        response = client.post("/research", json={"domain": "Climate adaptation"})
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "code": "SAFETY_UNAVAILABLE",
+            "message": "The safety check is temporarily unavailable. Please try again later.",
+        }
+    }
+    assert "test-api-key" not in response.text
+    assert router_environment.create_calls == []
+    assert router_environment.graph.start_inputs == []
+    router_environment.safety_policy.assert_not_called()
+
+
+def test_unexpected_policy_result_fails_closed(router_environment):
+    router_environment.safety_policy.return_value = SimpleNamespace(decision="unexpected")
+
+    with _client(router_environment) as client:
+        response = client.post("/research", json={"domain": "Climate adaptation"})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "SAFETY_UNAVAILABLE"
+    assert router_environment.create_calls == []
+    assert router_environment.graph.start_inputs == []
+
+
+@pytest.mark.parametrize("domain", ["", "   ", "x" * 501])
+def test_invalid_research_topic_is_rejected_before_safety(router_environment, domain):
+    with _client(router_environment) as client:
+        response = client.post("/research", json={"domain": domain})
+
+    assert response.status_code == 422
+    router_environment.safety_client.assert_not_awaited()
+    assert router_environment.create_calls == []
+    assert router_environment.graph.start_inputs == []
+
+
+def test_authentication_occurs_before_safety_service(router_environment):
+    router_environment.app.dependency_overrides.clear()
+
+    with _client(router_environment) as client:
+        response = client.post("/research", json={"domain": "Climate adaptation"})
+
+    assert response.status_code == 401
+    router_environment.safety_client.assert_not_awaited()
+    assert router_environment.create_calls == []
+    assert router_environment.graph.start_inputs == []
+
+
+def test_rate_limit_occurs_before_safety_service(router_environment, monkeypatch):
+    limiter = AsyncMock()
+    limiter.allow.return_value = False
+    monkeypatch.setattr(research, "_start_rate_limiter", limiter)
+
+    with _client(router_environment) as client:
+        response = client.post("/research", json={"domain": "Climate adaptation"})
+
+    assert response.status_code == 429
+    limiter.allow.assert_awaited_once_with("owner-1")
+    router_environment.safety_client.assert_not_awaited()
+    assert router_environment.create_calls == []
+    assert router_environment.graph.start_inputs == []
+
+
+def test_start_research_security_boundary_call_order(router_environment, monkeypatch):
+    calls: list[str] = []
+
+    async def authenticated_user():
+        calls.append("authentication")
+        return "owner-1"
+
+    class OrderedLimiter:
+        async def allow(self, user_id):
+            calls.append("rate_limit")
+            return True
+
+    async def classify(topic):
+        calls.append("safety_client")
+        return router_environment.safe_classification
+
+    def apply_policy(topic, classification):
+        calls.append("safety_policy")
+        return SafetyPolicyResult(decision=SafetyDecision.SAFE)
+
+    original_create_thread = research.create_thread
+    original_ainvoke = router_environment.graph.ainvoke
+
+    async def create(user_id, domain):
+        calls.append("create_thread")
+        return await original_create_thread(user_id, domain)
+
+    async def invoke(input_value, config=None):
+        calls.append("graph")
+        return await original_ainvoke(input_value, config=config)
+
+    router_environment.app.dependency_overrides[get_current_user] = authenticated_user
+    monkeypatch.setattr(research, "_start_rate_limiter", OrderedLimiter())
+    monkeypatch.setattr(research, "classify_research_topic", classify)
+    monkeypatch.setattr(research, "apply_safety_policy", apply_policy)
+    monkeypatch.setattr(research, "create_thread", create)
+    monkeypatch.setattr(router_environment.graph, "ainvoke", invoke)
+
+    with _client(router_environment) as client:
+        response = client.post("/research", json={"domain": "Original topic"})
+
+    assert response.status_code == 201
+    assert calls == [
+        "authentication",
+        "rate_limit",
+        "safety_client",
+        "safety_policy",
+        "create_thread",
+        "graph",
+    ]
 
 
 def test_start_research_graph_failure_marks_error_without_leaking_exception(router_environment):
@@ -346,3 +542,4 @@ def test_start_rate_limit_rejects_the_eleventh_request(router_environment):
 
     assert [response.status_code for response in responses[:10]] == [201] * 10
     assert responses[10].status_code == 429
+    assert router_environment.safety_client.await_count == 10

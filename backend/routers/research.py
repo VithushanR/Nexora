@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from langgraph.types import Command
 
 from backend.auth.jwt import get_current_user
@@ -19,6 +19,15 @@ from backend.research_threads import (
     get_thread,
     update_thread_status,
     verify_thread_owner,
+)
+from backend.safety.nvidia_client import (
+    NvidiaSafetyClientError,
+    classify_research_topic,
+)
+from backend.safety.policy import (
+    SafetyDecision,
+    SafetyPolicyInputError,
+    apply_safety_policy,
 )
 
 logger = logging.getLogger("nexora.research_router")
@@ -36,7 +45,14 @@ _STATUS_DETAILS = {
 
 
 class ResearchStartRequest(BaseModel):
-    domain: str
+    domain: str = Field(min_length=1, max_length=500)
+
+    @field_validator("domain")
+    @classmethod
+    def reject_blank_domain(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Research topic must not be blank.")
+        return value
 
 
 class SelectionRequest(BaseModel):
@@ -45,6 +61,11 @@ class SelectionRequest(BaseModel):
 
 class ResearchStartResponse(BaseModel):
     thread_id: str
+
+
+class SafetyErrorDetail(BaseModel):
+    code: Literal["SAFETY_UNSAFE", "SAFETY_NEEDS_CONTEXT", "SAFETY_UNAVAILABLE"]
+    message: str
 
 
 class ResearchStatusResponse(BaseModel):
@@ -117,6 +138,17 @@ class ResearchStartRateLimiter:
 
 
 _start_rate_limiter = ResearchStartRateLimiter()
+
+
+def _safety_http_error(
+    status_code: int,
+    code: Literal["SAFETY_UNSAFE", "SAFETY_NEEDS_CONTEXT", "SAFETY_UNAVAILABLE"],
+    message: str,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail=SafetyErrorDetail(code=code, message=message).model_dump(),
+    )
 
 
 @asynccontextmanager
@@ -212,6 +244,38 @@ async def start_research(
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Research start limit exceeded. Try again later.",
+        )
+
+    # The hosted safety gateway must pass before any thread metadata or graph
+    # checkpoint can be created. Agent 1 retains its own defense-in-depth check.
+    try:
+        classification = await classify_research_topic(request.domain)
+        safety_result = apply_safety_policy(request.domain, classification)
+    except (NvidiaSafetyClientError, SafetyPolicyInputError):
+        raise _safety_http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "SAFETY_UNAVAILABLE",
+            "The safety check is temporarily unavailable. Please try again later.",
+        ) from None
+
+    if safety_result.decision is SafetyDecision.UNSAFE:
+        raise _safety_http_error(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "SAFETY_UNSAFE",
+            safety_result.message or "This request cannot be processed as a research topic.",
+        )
+    if safety_result.decision is SafetyDecision.UNCERTAIN:
+        raise _safety_http_error(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "SAFETY_NEEDS_CONTEXT",
+            safety_result.message
+            or "Please provide clearer academic, prevention, policy, or research context.",
+        )
+    if safety_result.decision is not SafetyDecision.SAFE:
+        raise _safety_http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "SAFETY_UNAVAILABLE",
+            "The safety check is temporarily unavailable. Please try again later.",
         )
 
     thread_id = await create_thread(user_id, request.domain)
