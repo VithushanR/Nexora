@@ -190,12 +190,17 @@ export default function SearchPage() {
               return;
             }
             if (response.status === "error") {
-              setErrorMessage(response.detail || "Research processing failed. Please try again.");
+              const detail = response.detail?.trim();
+              setErrorMessage(
+                detail && detail !== "Research processing failed."
+                  ? detail
+                  : "Research stopped while finding or screening papers. Please try again; if it happens again, check the backend server log for the cause.",
+              );
               setIsThinking(false);
               return;
             }
             if (response.status === "running_agent2") {
-              setProgressMessage(response.detail || "Research is retrieving and screening papers.");
+              setProgressMessage(`running_agent2 — ${response.detail || "Research is retrieving and screening papers."}`);
               pollTimeoutRef.current = window.setTimeout(() => void checkStatus(), 2_000);
               return;
             }
@@ -221,6 +226,7 @@ export default function SearchPage() {
         setIsThinking(false);
       }
     } else {
+      setProgressMessage("");
       if (!doc) {
         setMessages((m) => [
           ...m,
@@ -344,7 +350,7 @@ export default function SearchPage() {
                 <div className="mb-4 flex items-center gap-2">
                   <Sparkle className="text-violet-400 dark:text-violet-300" />
                   <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
-                    {mode === "deep-search" ? progressMessage : "Searching the document…"}
+                    {progressMessage || "Searching the document…"}
                   </span>
                   <span className="thinking-dots text-violet-400">
                     <span>•</span><span>•</span><span>•</span>
@@ -409,6 +415,7 @@ export default function SearchPage() {
               <div className="flex items-center gap-0.5 rounded-full border border-slate-200 bg-white p-0.5 shadow-sm dark:border-slate-700 dark:bg-slate-800">
                 <button
                   onClick={() => setMode("chat")}
+                  disabled={isThinking}
                   className={`flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-medium transition ${
                     mode === "chat"
                       ? "bg-violet-100 text-violet-700 dark:bg-violet-900/50 dark:text-violet-300"
@@ -420,6 +427,7 @@ export default function SearchPage() {
                 </button>
                 <button
                   onClick={() => setMode("deep-search")}
+                  disabled={isThinking}
                   className={`flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-medium transition ${
                     mode === "deep-search"
                       ? "bg-violet-100 text-violet-700 dark:bg-violet-900/50 dark:text-violet-300"
