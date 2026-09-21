@@ -12,6 +12,15 @@ import GoogleSignInButton from "../auth/GoogleSignInButton";
 
 function userFacingError(error: unknown): string {
   if (error instanceof ApiClientError) {
+    if (error.code === "SAFETY_UNSAFE") {
+      return "This topic cannot be processed as a research request. Please choose a different academic topic.";
+    }
+    if (error.code === "SAFETY_NEEDS_CONTEXT") {
+      return "Please provide more context about the academic, clinical, prevention, policy, or research purpose of this topic.";
+    }
+    if (error.code === "SAFETY_UNAVAILABLE") {
+      return "The safety check is temporarily unavailable. Please try again later.";
+    }
     if (error.status === 401) {
       return "Your session has expired. Please sign in again to start research.";
     }
