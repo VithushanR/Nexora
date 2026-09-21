@@ -46,6 +46,16 @@ logger = logging.getLogger("nexora.agent2")
 SCREENING_CANDIDATE_CAP = int(os.getenv("SCREENING_CANDIDATE_CAP", "150"))
 MIN_ABSTRACT_CHARS = 50  # below this, skip the LLM call -- see screen_candidate
 
+# Bumped from 5 -> 10 after a real end-to-end timing run showed screen_all()
+# was the dominant cost of a /research request (~19s of a ~33s total) while
+# a concurrency=5 semaphore never let more than 5 Gemini calls run at once.
+# 47 real calls at concurrency=5 completed in that run at ~150 calls/minute
+# sustained with zero 429s, well under the account's actual quota -- see
+# backend/llm/client.py's BUDGET_EXHAUSTED_COOLDOWN_SECONDS, which now backs
+# off for a bounded window (not permanently) if this is ever raised past
+# what the account's Gemini tier allows.
+SCREENING_LLM_CONCURRENCY = int(os.getenv("SCREENING_LLM_CONCURRENCY", "10"))
+
 SCREENING_SYSTEM_PROMPT = """You are a literature screening assistant for a systematic research review.
 Decide INCLUDE, EXCLUDE, or UNCERTAIN based only on the abstract given.
 You MUST support your verdict with a quote copied EXACTLY from the abstract.
@@ -214,7 +224,7 @@ PAPER ABSTRACT:
     return {"verdict": result["verdict"], "quote": result.get("quote", ""), "reason": result.get("reason", "")}
 
 
-async def screen_all(candidates: list[Candidate], protocol: Protocol, concurrency: int = 5) -> list[Candidate]:
+async def screen_all(candidates: list[Candidate], protocol: Protocol, concurrency: int = SCREENING_LLM_CONCURRENCY) -> list[Candidate]:
     """Screens the capped candidate list. Bounded concurrency (not full
     fan-out) so screening 150 candidates doesn't slam the Gemini rate
     limit -- adjust `concurrency` against your account's actual per-minute

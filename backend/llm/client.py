@@ -5,14 +5,22 @@ contradiction confirmation, gap clustering) -- per the project's cost
 principles, everything else (retrieval, dedup, BM25, retraction lookups)
 stays deterministic and never touches this module.
 
-Global LLM_BUDGET_EXHAUSTED flag: once quota/credits run out, every
-subsequent call short-circuits instantly instead of hitting the API again,
-so a long pipeline run degrades gracefully instead of crashing partway
-through and losing everything computed so far.
+LLM_BUDGET_EXHAUSTED flag: once quota/credits run out, calls short-circuit
+instantly instead of hitting the API again, so a long pipeline run degrades
+gracefully instead of crashing partway through. This is a COOLDOWN, not a
+permanent kill switch: Gemini's RPM/TPM quotas reset on a rolling ~1-minute
+window, so a flag that stayed True forever would mean one transient 429 --
+tripped by, say, a raised screening concurrency -- silently degrades every
+future request in this process (across all users, not just the one that
+hit the limit) until the process is restarted. `LLM_BUDGET_EXHAUSTED` is
+exposed as a plain module attribute (module __getattr__, PEP 562) so
+existing direct reads like `llm_client.LLM_BUDGET_EXHAUSTED` keep working
+unchanged, but it now clears itself once the cooldown elapses.
 """
 
 import os
 import json
+import time
 import asyncio
 import logging
 from typing import Optional
@@ -25,8 +33,35 @@ logger = logging.getLogger("nexora.llm")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
+# How long to short-circuit LLM calls after a quota/budget error before
+# trying the API again. Matches Gemini's rolling per-minute RPM/TPM window --
+# long enough that we don't hammer an API that just told us to back off,
+# short enough that one transient limit hit doesn't degrade the rest of an
+# unrelated later request.
+BUDGET_EXHAUSTED_COOLDOWN_SECONDS = float(os.getenv("LLM_BUDGET_COOLDOWN_SECONDS", "60"))
+
 _client: Optional[genai.Client] = None
-LLM_BUDGET_EXHAUSTED = False
+_budget_exhausted_until: Optional[float] = None
+
+
+def _is_budget_exhausted() -> bool:
+    return _budget_exhausted_until is not None and time.monotonic() < _budget_exhausted_until
+
+
+def _trip_budget_exhausted() -> None:
+    global _budget_exhausted_until
+    _budget_exhausted_until = time.monotonic() + BUDGET_EXHAUSTED_COOLDOWN_SECONDS
+
+
+def __getattr__(name: str):
+    # PEP 562 module-level dynamic attribute. Only fires for names not set
+    # as real module globals -- LLM_BUDGET_EXHAUSTED is deliberately never
+    # assigned as a plain global below, so every external read (e.g.
+    # synthesis_integrity.py's `llm_client.LLM_BUDGET_EXHAUSTED`) resolves
+    # live off the cooldown timer instead of a stale True/False snapshot.
+    if name == "LLM_BUDGET_EXHAUSTED":
+        return _is_budget_exhausted()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Use the typed HarmCategory/HarmBlockThreshold enums, not raw strings --
 # the SDK's stubs are strict about this (Pylance: "Literal[...] is not
@@ -62,8 +97,8 @@ def _get_client() -> genai.Client:
 
 def reset_budget_flag_for_tests():
     """Test-only helper -- production code should never reset this mid-run."""
-    global LLM_BUDGET_EXHAUSTED
-    LLM_BUDGET_EXHAUSTED = False
+    global _budget_exhausted_until
+    _budget_exhausted_until = None
 
 
 async def llm_json_call(system_prompt: str, user_prompt: str, *,
@@ -82,8 +117,7 @@ async def llm_json_call(system_prompt: str, user_prompt: str, *,
     failure as a clean empty result. See gaps_status / contradictions_status
     in the synthesis and gap-discovery agents for the pattern to follow.
     """
-    global LLM_BUDGET_EXHAUSTED
-    if LLM_BUDGET_EXHAUSTED:
+    if _is_budget_exhausted():
         return {"_budget_exhausted": True}
 
     client = _get_client()
@@ -128,8 +162,11 @@ async def llm_json_call(system_prompt: str, user_prompt: str, *,
         except Exception as e:
             msg = str(e)
             if any(tok in msg for tok in ("RESOURCE_EXHAUSTED", "429", "402")) or "quota" in msg.lower():
-                logger.error("LLM budget/quota exhausted: %s", msg[:200])
-                LLM_BUDGET_EXHAUSTED = True
+                logger.error(
+                    "LLM budget/quota exhausted: %s -- backing off for %.0fs",
+                    msg[:200], BUDGET_EXHAUSTED_COOLDOWN_SECONDS,
+                )
+                _trip_budget_exhausted()
                 return {"_budget_exhausted": True}
             if attempt == retries:
                 logger.error("LLM call raised an exception for [%s]: %s", debug_label, msg[:300])
