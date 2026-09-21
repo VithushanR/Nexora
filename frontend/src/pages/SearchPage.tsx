@@ -8,11 +8,13 @@ import {
   ApiConfigurationError,
   ApiError,
   ApiNetworkError,
+  getResearchStatus,
   startResearch,
   uploadDocument,
   sendDocumentChat,
 } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
+import GoogleSignInButton from "../auth/GoogleSignInButton";
 import type { DocumentUploadResponse } from "../types";
 
 type Mode = "chat" | "deep-search";
@@ -44,31 +46,41 @@ const CHAT_MD: Components = {
 
 function userFacingError(error: unknown): string {
   if (error instanceof ApiClientError) {
-    if (error.status === 401) return "Your session has expired. Please sign in again.";
-    if (error.status === 503) return "The service is not configured yet. Please try again later.";
-    if (error.status === 422) return "This topic was rejected. Please enter a clear research topic.";
-    if (error.status === 429) return "Too many requests. Please wait and try again.";
-    if (error.status === 500) return "Something went wrong on the server. Please try again.";
-    return "The request could not be completed. Please try again.";
+    if (error.code === "SAFETY_UNSAFE") {
+      return "This topic cannot be processed as a research request. Please choose a different academic topic.";
+    }
+    if (error.code === "SAFETY_NEEDS_CONTEXT") {
+      return "Please provide more context about the academic, clinical, prevention, policy, or research purpose of this topic.";
+    }
+    if (error.code === "SAFETY_UNAVAILABLE") {
+      return "The safety check is temporarily unavailable. Please try again later.";
+    }
+    if (error.status === 401) {
+      return "Your session has expired. Please sign in again to start research.";
+    }
+    if (error.status === 503) {
+      return "Research sign-in/setup is not configured yet. Please try again after authentication is enabled.";
+    }
+    if (error.status === 422) {
+      return "This research topic was rejected. Please enter a clear academic research topic.";
+    }
+    if (error.status === 429) {
+      return "Too many research requests were made. Please wait and try again later.";
+    }
+    if (error.status === 500) {
+      return "Research could not be started. Please try again later.";
+    }
+    return "The research service could not complete the request. Please try again.";
   }
-  if (error instanceof ApiConfigurationError) return "Backend API is not configured.";
-  if (error instanceof ApiNetworkError) return "Unable to reach the server. Check your connection.";
-  return "Something went wrong. Please try again.";
+  if (error instanceof ApiConfigurationError) return "The frontend is not configured with a backend API URL.";
+  if (error instanceof ApiNetworkError) return "Unable to reach the research service. Check the connection and try again.";
+  return "Something went wrong while starting research. Please try again.";
 }
 
 function Sparkle({ className = "", size = 16 }: { className?: string; size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" className={className}>
       <path d="M12 2l2.4 7.6L22 12l-7.6 2.4L12 22l-2.4-7.6L2 12l7.6-2.4z" />
-    </svg>
-  );
-}
-
-function StepCheck() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" className="shrink-0 text-emerald-500">
-      <circle cx="12" cy="12" r="10" fill="currentColor" opacity="0.15" />
-      <path d="M8 12l3 3 5-5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }
@@ -81,8 +93,9 @@ export default function SearchPage() {
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [isThinking, setIsThinking] = useState(false);
-  const [thinkingStep, setThinkingStep] = useState(0);
+  const [progressMessage, setProgressMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [needsSignIn, setNeedsSignIn] = useState(false);
 
   const [doc, setDoc] = useState<DocumentUploadResponse | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -90,6 +103,16 @@ export default function SearchPage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const pollTimeoutRef = useRef<number | undefined>(undefined);
+  const pollActiveRef = useRef(true);
+
+  useEffect(() => {
+    pollActiveRef.current = true;
+    return () => {
+      pollActiveRef.current = false;
+      window.clearTimeout(pollTimeoutRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -105,24 +128,13 @@ export default function SearchPage() {
 
   useEffect(() => {
     if (status === "signed-in") {
+      setNeedsSignIn(false);
       setErrorMessage((c) =>
-        c === "Please sign in with Google before starting research." ? null : c,
+        c === "Please sign in with Google before starting research." ||
+        c === "Your session has expired. Please sign in again to start research." ? null : c,
       );
     }
   }, [status]);
-
-  useEffect(() => {
-    if (!isThinking) {
-      setThinkingStep(0);
-      return;
-    }
-    const t1 = setTimeout(() => setThinkingStep(1), 1200);
-    const t2 = setTimeout(() => setThinkingStep(2), 2800);
-    return () => {
-      clearTimeout(t1);
-      clearTimeout(t2);
-    };
-  }, [isThinking]);
 
   async function handleFileUpload(file: File) {
     if (!file.name.toLowerCase().endsWith(".pdf")) {
@@ -154,34 +166,58 @@ export default function SearchPage() {
     if (mode === "deep-search") {
       if (status !== "signed-in") {
         setErrorMessage("Please sign in with Google before starting research.");
+        setNeedsSignIn(true);
         return;
       }
+      setNeedsSignIn(false);
 
       setMessages((m) => [...m, { id: `u-${Date.now()}`, role: "user", content: trimmed }]);
       setInput("");
       setIsThinking(true);
+      setProgressMessage("Starting research…");
 
       try {
         const { thread_id } = await startResearch({ domain: trimmed });
-        setMessages((m) => [
-          ...m,
-          {
-            id: `a-${Date.now()}`,
-            role: "assistant",
-            content:
-              "Research initiated! Finding and screening academic papers for your topic. Redirecting to paper selection…",
-          },
-        ]);
-        setTimeout(() => navigate(`/select/${thread_id}`), 1500);
+        // Match the report screen: poll once now, then schedule the next request
+        // only after the current one has completed.
+        async function checkStatus(): Promise<void> {
+          try {
+            const response = await getResearchStatus(thread_id);
+            if (!pollActiveRef.current) return;
+            if (response.status === "paused_for_selection") {
+              setIsThinking(false);
+              navigate(`/select/${thread_id}`);
+              return;
+            }
+            if (response.status === "error") {
+              setErrorMessage(response.detail || "Research processing failed. Please try again.");
+              setIsThinking(false);
+              return;
+            }
+            if (response.status === "running_agent2") {
+              setProgressMessage(response.detail || "Research is retrieving and screening papers.");
+              pollTimeoutRef.current = window.setTimeout(() => void checkStatus(), 2_000);
+              return;
+            }
+            setErrorMessage(`Research returned an unexpected status: ${response.status}.`);
+            setIsThinking(false);
+          } catch (error) {
+            if (!pollActiveRef.current) return;
+            if (error instanceof ApiClientError && error.status === 401) {
+              signOut();
+              setNeedsSignIn(true);
+            }
+            setErrorMessage(userFacingError(error));
+            setIsThinking(false);
+          }
+        }
+        await checkStatus();
       } catch (error) {
         if (error instanceof ApiClientError && error.status === 401) {
           signOut();
+          setNeedsSignIn(true);
         }
-        setMessages((m) => [
-          ...m,
-          { id: `err-${Date.now()}`, role: "assistant", content: userFacingError(error) },
-        ]);
-      } finally {
+        setErrorMessage(userFacingError(error));
         setIsThinking(false);
       }
     } else {
@@ -191,19 +227,11 @@ export default function SearchPage() {
           { id: `u-${Date.now()}`, role: "user", content: trimmed },
         ]);
         setInput("");
-        setIsThinking(true);
-        setTimeout(() => {
-          setMessages((m) => [
-            ...m,
-            {
-              id: `a-${Date.now()}`,
-              role: "assistant",
-              content:
-                "Upload a document using the **+** button to start chatting about it, or switch to **Deep Search** to explore academic research.",
-            },
-          ]);
-          setIsThinking(false);
-        }, 3000);
+        setMessages((m) => [...m, {
+          id: `a-${Date.now()}`,
+          role: "assistant",
+          content: "Upload a document using the **+** button to start chatting about it, or switch to **Deep Search** to explore academic research.",
+        }]);
         return;
       }
 
@@ -238,12 +266,6 @@ export default function SearchPage() {
   }
 
   const hasMessages = messages.length > 0;
-
-  const stepLabels = [
-    "Reading your question",
-    mode === "deep-search" ? "Searching academic databases" : "Searching the document",
-    "Preparing a response",
-  ];
 
   return (
     <div className="flex h-full flex-col">
@@ -310,7 +332,7 @@ export default function SearchPage() {
               </div>
             ))}
 
-            {/* Step-by-step thinking indicator */}
+            {/* Backend status during research; a simple activity indicator for document chat. */}
             {isThinking && (
               <div className="py-4">
                 <div className="mb-3 flex items-center gap-2">
@@ -321,40 +343,14 @@ export default function SearchPage() {
 
                 <div className="mb-4 flex items-center gap-2">
                   <Sparkle className="text-violet-400 dark:text-violet-300" />
-                  <span className="text-sm font-medium text-slate-700 dark:text-slate-300">Thinking</span>
+                  <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                    {mode === "deep-search" ? progressMessage : "Searching the document…"}
+                  </span>
                   <span className="thinking-dots text-violet-400">
                     <span>•</span><span>•</span><span>•</span>
                   </span>
                 </div>
 
-                <div className="ml-4 space-y-2.5 border-l-2 border-violet-100 pl-4 dark:border-violet-800/60">
-                  {stepLabels.map((label, i) => {
-                    const done = thinkingStep > i;
-                    const active = thinkingStep === i;
-                    return (
-                      <div key={i} className="flex items-center gap-2.5">
-                        {done ? (
-                          <StepCheck />
-                        ) : active ? (
-                          <div className="step-spinner shrink-0" />
-                        ) : (
-                          <div className="h-4 w-4 shrink-0 rounded-full border-2 border-slate-200 dark:border-slate-600" />
-                        )}
-                        <span
-                          className={`text-sm ${
-                            done
-                              ? "text-slate-500 dark:text-slate-400"
-                              : active
-                                ? "font-medium text-slate-800 dark:text-slate-200"
-                                : "text-slate-400 dark:text-slate-500"
-                          }`}
-                        >
-                          {label}
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
               </div>
             )}
 
@@ -400,8 +396,9 @@ export default function SearchPage() {
 
           {/* Error */}
           {errorMessage && (
-            <div className="mb-2 rounded-xl bg-red-50 px-3 py-2 text-xs text-red-700 dark:bg-red-900/20 dark:text-red-400">
+            <div role="alert" className="mb-2 rounded-xl bg-red-50 px-3 py-2 text-xs text-red-700 dark:bg-red-900/20 dark:text-red-400">
               <p>{errorMessage}</p>
+              {needsSignIn && <GoogleSignInButton width={210} />}
             </div>
           )}
 

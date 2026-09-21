@@ -38,6 +38,7 @@ export class ApiClientError extends ApiError {
   constructor(
     public readonly status: number,
     message: string,
+    public readonly code?: string,
   ) {
     super(message);
     this.name = "ApiClientError";
@@ -166,16 +167,29 @@ async function parseJson(response: Response): Promise<unknown> {
   }
 }
 
-function responseDetail(payload: unknown, fallback: string): string {
-  if (
-    typeof payload === "object" &&
-    payload !== null &&
-    "detail" in payload &&
-    typeof payload.detail === "string"
-  ) {
-    return payload.detail;
+interface ResponseErrorDetail {
+  message: string;
+  code?: string;
+}
+
+function responseDetail(payload: unknown, fallback: string): ResponseErrorDetail {
+  if (typeof payload === "object" && payload !== null && "detail" in payload) {
+    if (typeof payload.detail === "string") {
+      return { message: payload.detail };
+    }
+    if (typeof payload.detail === "object" && payload.detail !== null) {
+      const message =
+        "message" in payload.detail && typeof payload.detail.message === "string"
+          ? payload.detail.message
+          : fallback;
+      const code =
+        "code" in payload.detail && typeof payload.detail.code === "string"
+          ? payload.detail.code
+          : undefined;
+      return { message, code };
+    }
   }
-  return fallback;
+  return { message: fallback };
 }
 
 async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -200,9 +214,14 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
 
   const payload = await parseJson(response);
   if (!response.ok) {
+    const detail = responseDetail(
+      payload,
+      "The research service could not complete the request.",
+    );
     throw new ApiClientError(
       response.status,
-      responseDetail(payload, "The research service could not complete the request."),
+      detail.message,
+      detail.code,
     );
   }
   return payload as T;
@@ -354,9 +373,11 @@ export async function uploadDocument(file: File): Promise<DocumentUploadResponse
 
   const payload = await parseJson(response);
   if (!response.ok) {
+    const detail = responseDetail(payload, "The document could not be uploaded.");
     throw new ApiClientError(
       response.status,
-      responseDetail(payload, "The document could not be uploaded."),
+      detail.message,
+      detail.code,
     );
   }
   return payload as DocumentUploadResponse;
