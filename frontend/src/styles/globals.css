@@ -17,3 +17,94 @@ body {
   -webkit-font-smoothing: antialiased;
   background-color: #f8fafc;
 }
+
+html.dark body {
+  background-color: #020617;
+}
+
+/* ThoughtLine — animated gradient beam during thinking/generation */
+.thought-line {
+  height: 3px;
+  position: relative;
+  overflow: hidden;
+}
+
+.thought-line::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 40%;
+  height: 100%;
+  border-radius: 2px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    #8b5cf6,
+    #a78bfa,
+    #c084fc,
+    transparent
+  );
+  box-shadow: 0 0 12px rgba(139, 92, 246, 0.4),
+    0 0 4px rgba(139, 92, 246, 0.2);
+  animation: thought-sweep 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@keyframes thought-sweep {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(280%);
+  }
+}
+
+/* Thinking dots animation */
+.thinking-dots span {
+  display: inline-block;
+  font-size: 18px;
+  line-height: 1;
+  animation: dot-pulse 1.4s ease-in-out infinite;
+  opacity: 0.25;
+}
+.thinking-dots span:nth-child(1) {
+  animation-delay: 0s;
+}
+.thinking-dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.thinking-dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes dot-pulse {
+  0%,
+  60%,
+  100% {
+    opacity: 0.25;
+  }
+  30% {
+    opacity: 1;
+  }
+}
+
+/* Step spinner */
+.step-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid #e2e8f0;
+  border-top-color: #7c3aed;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+html.dark .step-spinner {
+  border-color: #475569;
+  border-top-color: #a78bfa;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
