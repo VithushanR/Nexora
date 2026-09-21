@@ -1,5 +1,8 @@
 """No-I/O tests for the research HTTP API."""
 
+import asyncio
+import logging
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -7,7 +10,7 @@ from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from fastapi import FastAPI
+from fastapi import BackgroundTasks, FastAPI
 from fastapi.testclient import TestClient
 
 from backend.auth.jwt import create_access_token, get_current_user
@@ -71,6 +74,8 @@ class FakeGraph:
         self.report: str | None = "# Completed report"
         self.resume_payloads: list[dict[str, Any]] = []
         self.start_inputs: list[dict[str, Any]] = []
+        self.start_entered = asyncio.Event()
+        self.start_release: asyncio.Event | None = None
 
     async def ainvoke(self, input_value, config=None):
         if hasattr(input_value, "resume"):
@@ -79,9 +84,12 @@ class FakeGraph:
                 raise RuntimeError("controlled resume failure")
             self.interrupted = False
             return {"report": self.report}
+        self.start_inputs.append(input_value)
+        self.start_entered.set()
+        if self.start_release is not None:
+            await self.start_release.wait()
         if self.fail_start:
             raise RuntimeError("controlled start failure")
-        self.start_inputs.append(input_value)
         return {"__interrupt__": [FakeInterrupt({"kind": "paper_selection"})]}
 
     async def aget_state(self, config):
@@ -187,6 +195,47 @@ def test_start_research_reaches_selection_and_returns_created_thread(router_envi
     router_environment.safety_policy.assert_called_once_with(
         "Climate adaptation", router_environment.safe_classification
     )
+
+
+@pytest.mark.asyncio
+async def test_start_returns_before_initial_graph_and_exposes_real_status(
+    router_environment,
+):
+    router_environment.graph.start_release = asyncio.Event()
+    background_tasks = BackgroundTasks()
+
+    started_at = time.perf_counter()
+    response = await asyncio.wait_for(
+        research.start_research(
+            research.ResearchStartRequest(domain="Climate adaptation"),
+            background_tasks,
+            "owner-1",
+        ),
+        timeout=0.25,
+    )
+    elapsed = time.perf_counter() - started_at
+
+    assert elapsed < 0.25
+    assert router_environment.graph.start_entered.is_set() is False
+    assert len(background_tasks.tasks) == 1
+    thread = router_environment.threads[response.thread_id]
+    assert thread.status == "running_agent2"
+
+    running_status = await research.research_status(response.thread_id, "owner-1")
+    assert running_status.model_dump() == {
+        "status": "running_agent2",
+        "detail": "Research is planning the protocol and screening papers.",
+    }
+
+    task_runner = asyncio.create_task(background_tasks())
+    await asyncio.wait_for(router_environment.graph.start_entered.wait(), timeout=0.25)
+    assert thread.status == "running_agent2"
+    assert (response.thread_id, "paused_for_selection") not in router_environment.updates
+
+    router_environment.graph.start_release.set()
+    await asyncio.wait_for(task_runner, timeout=0.25)
+    assert thread.status == "paused_for_selection"
+    assert (response.thread_id, "paused_for_selection") in router_environment.updates
 
 
 @pytest.mark.parametrize(
@@ -348,16 +397,27 @@ def test_start_research_security_boundary_call_order(router_environment, monkeyp
     ]
 
 
-def test_start_research_graph_failure_marks_error_without_leaking_exception(router_environment):
+def test_start_research_background_failure_marks_error_and_exposes_safe_status(
+    router_environment, caplog
+):
     router_environment.graph.fail_start = True
 
-    with _client(router_environment) as client:
+    with caplog.at_level(logging.ERROR, logger="nexora.research_router"):
+        client = _client(router_environment)
         response = client.post("/research", json={"domain": "Climate adaptation"})
+        thread_id = response.json()["thread_id"]
+        status_response = client.get(f"/research/{thread_id}/status")
+        client.close()
 
-    assert response.status_code == 500
-    assert response.json()["detail"] == "Research processing failed."
-    assert all("controlled start failure" not in str(value) for value in response.json().values())
-    assert next(iter(router_environment.threads.values())).status == "error"
+    assert response.status_code == 201
+    assert status_response.status_code == 200
+    assert status_response.json() == {
+        "status": "error",
+        "detail": "Research processing failed.",
+    }
+    assert "controlled start failure" not in response.text
+    assert router_environment.threads[thread_id].status == "error"
+    assert "Initial research graph run failed" in caplog.text
 
 
 def test_missing_bearer_token_is_rejected(router_environment):

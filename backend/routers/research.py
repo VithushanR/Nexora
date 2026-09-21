@@ -36,7 +36,7 @@ router = APIRouter(prefix="/research", tags=["research"])
 
 THREAD_CONFIG = lambda thread_id: {"configurable": {"thread_id": thread_id}}
 _STATUS_DETAILS = {
-    "running_agent2": "Research is retrieving and screening papers.",
+    "running_agent2": "Research is planning the protocol and screening papers.",
     "paused_for_selection": "Research is waiting for paper selection.",
     "running_synthesis": "Research is synthesizing the selected papers.",
     "done": "Research is complete.",
@@ -235,9 +235,25 @@ async def _resume_research(thread_id: str, selected_indices: list[int]) -> None:
         await _mark_error(thread_id)
 
 
+async def _start_initial_research(thread_id: str, domain: str) -> None:
+    """BackgroundTask body for the Agent 1/2 phase through selection pause."""
+    config = THREAD_CONFIG(thread_id)
+    try:
+        async with graph_context() as app:
+            await app.ainvoke({"domain": domain}, config=config)
+            snapshot = await app.aget_state(config)
+        if not _has_selection_interrupt(snapshot):
+            raise RuntimeError("Graph did not reach the paper-selection checkpoint.")
+        await update_thread_status(thread_id, "paused_for_selection")
+    except Exception:
+        logger.exception("Initial research graph run failed for thread %s.", thread_id)
+        await _mark_error(thread_id)
+
+
 @router.post("", response_model=ResearchStartResponse, status_code=status.HTTP_201_CREATED)
 async def start_research(
     request: ResearchStartRequest,
+    background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user),
 ) -> ResearchStartResponse:
     if not await _start_rate_limiter.allow(user_id):
@@ -279,22 +295,7 @@ async def start_research(
         )
 
     thread_id = await create_thread(user_id, request.domain)
-    config = THREAD_CONFIG(thread_id)
-    try:
-        async with graph_context() as app:
-            await app.ainvoke({"domain": request.domain}, config=config)
-            snapshot = await app.aget_state(config)
-        if not _has_selection_interrupt(snapshot):
-            raise RuntimeError("Graph did not reach the paper-selection checkpoint.")
-        await update_thread_status(thread_id, "paused_for_selection")
-    except Exception:
-        logger.exception("Initial research graph run failed for thread %s.", thread_id)
-        await _mark_error(thread_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Research processing failed.",
-        ) from None
-
+    background_tasks.add_task(_start_initial_research, thread_id, request.domain)
     return ResearchStartResponse(thread_id=thread_id)
 
 
