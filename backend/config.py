@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     openalex_mailto: str = ""
     semantic_scholar_api_key: str | None = None
+    nvidia_api_key: str = ""
     sqlite_db_path: str = "nexora_checkpoints.sqlite"
     thread_metadata_db_path: str = "nexora_threads.sqlite"
 

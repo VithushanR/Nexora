@@ -129,7 +129,10 @@ _INJECTION_PATTERNS = (
     re.compile(r"\b(?:you are now|act as)\b.{0,80}\b(?:system|developer|assistant)\b", re.I),
 )
 _GUIDANCE_MARKERS = re.compile(
-    r"\b(?:how to|instructions?|steps?|guide|recipe)\b",
+    r"\b(?:how to|how can (?:i|we|someone)|ways? to|"
+    r"(?:best|easiest|fastest|most effective) (?:way|method|technique)s? (?:to|for)|"
+    r"instructions?(?: for| to)?|step[- ]by[- ]step|steps?|"
+    r"guides?(?: to| for)?|methods? (?:to|for)|techniques? (?:to|for)|recipes?)\b",
     re.I,
 )
 _ABUSIVE_ACTIONS = re.compile(
@@ -138,11 +141,13 @@ _ABUSIVE_ACTIONS = re.compile(
 )
 _HARMFUL_TERMS = re.compile(
     r"\b(?:bombs?|explosives?|weapons?|poisons?|ransomware|malware|keyloggers?|credential theft|phishing|"
-    r"suicide|self[- ]harm|sexual abuse of (?:a )?minor|child sexual|harmful devices?)\b",
+    r"suicide|self[- ]harm|(?:kill|hurt|harm) (?:myself|yourself|oneself)|"
+    r"(?:end|take) (?:my|your|one'?s|their) (?:own )?life|"
+    r"sexual (?:violence|assault|abuse)|sexual abuse of (?:a )?minor|child sexual|harmful devices?)\b",
     re.I,
 )
 _DEFENSIVE_INTENT = re.compile(
-    r"\b(?:detect(?:ion|or)?|defen[cs]e|mitigat(?:e|ion)|prevent(?:ion)?|"
+    r"\b(?:detect(?:ion|or|ing)?|defen[cs]e|mitigat(?:e|ion|ing)|prevent(?:ion|ing)?|"
     r"secure|hardening|resilience|protection)\b",
     re.I,
 )
