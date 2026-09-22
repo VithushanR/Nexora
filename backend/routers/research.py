@@ -276,13 +276,13 @@ async def start_research(
 
     if safety_result.decision is SafetyDecision.UNSAFE:
         raise _safety_http_error(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
             "SAFETY_UNSAFE",
             safety_result.message or "This request cannot be processed as a research topic.",
         )
     if safety_result.decision is SafetyDecision.UNCERTAIN:
         raise _safety_http_error(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
             "SAFETY_NEEDS_CONTEXT",
             safety_result.message
             or "Please provide clearer academic, prevention, policy, or research context.",

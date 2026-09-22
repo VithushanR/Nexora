@@ -16,7 +16,7 @@ a test run that never embeds anything should never pay that cost.
 import asyncio
 import logging
 import os
-from typing import Optional, Sequence
+from typing import Optional, Protocol, Sequence
 
 import numpy as np
 
@@ -24,7 +24,21 @@ logger = logging.getLogger("nexora.embeddings")
 
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-_model = None
+
+class _Encoder(Protocol):
+    """Structural shape this module actually needs from a model: just
+    `.encode(...)`. Real SentenceTransformer instances satisfy this
+    naturally; so does any test stub set via set_model_for_tests(), without
+    importing the real (lazily-loaded) SentenceTransformer class just for
+    a type annotation."""
+
+    def encode(
+        self, texts: Sequence[str], /, *,
+        normalize_embeddings: bool = ..., show_progress_bar: Optional[bool] = ...,
+    ) -> object: ...
+
+
+_model: Optional[_Encoder] = None
 
 
 class EmbeddingUnavailableError(Exception):
@@ -33,7 +47,7 @@ class EmbeddingUnavailableError(Exception):
     rather than silently skipping the step that needed it."""
 
 
-def get_model():
+def get_model() -> _Encoder:
     """Loads and caches the sentence-transformer. Blocking -- call via
     embed(), which pushes it to a thread."""
     global _model
@@ -46,6 +60,11 @@ def get_model():
             raise EmbeddingUnavailableError(
                 f"Could not load embedding model {EMBEDDING_MODEL}: {e}"
             ) from e
+    # The block above always assigns a non-None _model or raises -- pyright
+    # doesn't narrow a global across the `global` statement the way it
+    # narrows a local, so this makes that guarantee explicit (same idiom as
+    # auth/jwt.py's JWT_SECRET_KEY narrowing).
+    assert _model is not None
     return _model
 
 
@@ -79,7 +98,7 @@ def reset_model_cache_for_tests() -> None:
     _model = None
 
 
-def set_model_for_tests(model: Optional[object]) -> None:
+def set_model_for_tests(model: Optional[_Encoder]) -> None:
     """Test-only helper: inject a stub encoder so tests can exercise the
     similarity path without downloading real weights."""
     global _model
