@@ -18,6 +18,7 @@ Run with: pytest backend/tests/test_report_pipeline_to_copilot.py -v
 """
 
 import pytest
+from typing import cast
 from unittest.mock import Mock, patch
 
 from langgraph.graph import StateGraph, START, END
@@ -120,7 +121,7 @@ async def test_report_assembly_registers_real_report_for_copilot_indexing():
     app = _build_report_assembly_only_graph()
 
     result = await app.ainvoke(
-        dict(FAKE_STATE), config={"configurable": {"thread_id": THREAD_ID}},
+        cast(ResearchState, dict(FAKE_STATE)), config={"configurable": {"thread_id": THREAD_ID}},
     )
 
     # The markdown path (GET /research/{thread_id}/report) still works.

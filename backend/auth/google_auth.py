@@ -38,6 +38,7 @@ the same pattern as JWT_SECRET_KEY and ENCRYPTION_KEY.
 """
 
 import os
+from typing import Any, Mapping
 
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
@@ -67,7 +68,7 @@ _google_request = google_requests.Request()
 # ---------------------------------------------------------------------------
 
 
-def verify_google_id_token(id_token_str: str) -> dict:
+def verify_google_id_token(id_token_str: str) -> Mapping[str, Any]:
     """
     Verifies a Google ID token's signature AND that it was issued for
     this specific application (audience check).

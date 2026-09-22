@@ -49,7 +49,7 @@ from backend.llm.client import llm_json_call
 from backend.llm.embeddings import (
     embed, cosine_similarity_matrix, EmbeddingUnavailableError,
 )
-from backend.sources.crossref import check_retraction
+from backend.sources.crossref import check_retraction, RetractionStatus
 from backend.sources.fulltext import get_full_text
 from backend.graph.state import ResearchState, Candidate
 
@@ -251,7 +251,7 @@ async def summarize_section(label: str, text: str, paper_title: str = "") -> str
 # Steps 1-4: one evidence row per paper
 # ------------------------------------------------------------------
 
-async def integrity_check(client: httpx.AsyncClient, paper: Candidate) -> dict:
+async def integrity_check(client: httpx.AsyncClient, paper: Candidate) -> RetractionStatus:
     """Retraction status for one paper.
 
     An arXiv paper with no registered DOI is short-circuited rather than

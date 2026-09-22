@@ -18,7 +18,7 @@ from backend.report.store import register_report
 # ============================================================
 
 
-def merge_report(state: dict) -> str:
+def merge_report(state: ResearchState) -> str:
     """Combine Agent 3 and Agent 4 output into one markdown report.
 
     None means the agent crashed. An empty list means it ran and found
@@ -167,7 +167,7 @@ def _map_gap_for_copilot(gap: dict) -> dict:
     }
 
 
-def build_structured_report(state: dict) -> dict:
+def build_structured_report(state: ResearchState) -> dict:
     """Builds the dict backend/report/store.py registers for Copilot
     indexing, from the same state merge_report() renders to Markdown."""
     return {
