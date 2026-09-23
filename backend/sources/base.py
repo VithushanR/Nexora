@@ -4,13 +4,49 @@ HTTP client per source, per your tech-stack decision (httpx + tenacity +
 aiolimiter). Nothing here calls an LLM -- retrieval is fully deterministic.
 """
 
+import html
 import os
+import re
 import logging
+from typing import Optional, overload
 import httpx
 from aiolimiter import AsyncLimiter
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 logger = logging.getLogger("nexora.sources")
+
+#  Deliberately NOT a blanket "<[^>]+>": several of these sources (arXiv,
+# Semantic Scholar) are math/CS abstracts where a bare "<" or ">" can be
+# genuine inequality notation (e.g. "for x < 4 and y > 2"). Requiring the
+# character right after "<" to be a letter -- real tag syntax always looks
+# like <tagname ...> or </tagname>, never "< 4" or "<4" -- avoids treating
+# that prose as markup while still catching real tags like <h4>, </h4>,
+# <i>, <sub>, <a href="...">.
+_TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9]*(?:\s+[^<>]*)?/?>")
+
+
+@overload
+def strip_html_tags(text: None) -> None: ...
+@overload
+def strip_html_tags(text: str) -> str: ...
+def strip_html_tags(text: Optional[str]) -> Optional[str]:
+    """Strips embedded HTML/XML markup from a source's raw abstract text.
+
+    Some sources return structured abstracts with inline tags -- e.g. Europe
+    PMC's abstractText commonly contains "<h4>Methods</h4>...<h4>Results</h4>"
+    section headers (confirmed against real API responses), and OpenAlex's
+    abstract_inverted_index can preserve the same tags verbatim as literal
+    tokens when the underlying publisher text was JATS-tagged. Left
+    unstripped, this markup doesn't just look wrong on screen -- it also
+    reaches LLM screening/summarization prompts as if it were content.
+    Applied at every source's abstract extraction point (not just the
+    display layer) so the stored abstract is always clean text, however it
+    will be used downstream.
+    """
+    if not text:
+        return text
+    without_tags = _TAG_RE.sub(" ", text)
+    return " ".join(html.unescape(without_tags).split())
 
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL")
 if not CONTACT_EMAIL:

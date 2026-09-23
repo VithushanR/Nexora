@@ -86,20 +86,30 @@ def _table_cell(value):
     return text.replace("|", "\\|")
 
 
+def _source_link_cell(paper_url) -> str:
+    """A clickable markdown link when a real URL is available. Never
+    fabricates one -- a paper with no known link (no OA PDF, arXiv ID, DOI,
+    or PMCID) shows an honest "no link available" instead of a guessed URL."""
+    if not paper_url:
+        return "no link available"
+    return f"[Source]({_table_cell(paper_url)})"
+
+
 def render_evidence_table(rows):
     """Render Agent 3's evidence table as markdown."""
     if not rows:
         return "## Evidence Table\n\nNo evidence rows available.\n"
 
     lines = ["## Evidence Table\n"]
-    lines.append("| Paper | Method | Key finding |")
-    lines.append("| --- | --- | --- |")
+    lines.append("| Paper | Method | Key finding | Source |")
+    lines.append("| --- | --- | --- | --- |")
 
     for row in rows:
         title = _table_cell(row.get("title", "—"))
         method = _table_cell(row.get("method", "—"))
         finding = _table_cell(row.get("finding", "—"))
-        lines.append(f"| {title} | {method} | {finding} |")
+        source = _source_link_cell(row.get("paper_url"))
+        lines.append(f"| {title} | {method} | {finding} | {source} |")
 
     lines.append("")
     return "\n".join(lines)
@@ -212,28 +222,38 @@ async def report_assembly_node(state: ResearchState) -> dict:
 
 
 # ============================================================
-# OPTIONAL: PDF EXPORT (bonus, not wired into build_graph.py)
+# PDF EXPORT -- wired into GET /research/{thread_id}/report/pdf
+# (backend/routers/research.py). reportlab is a real dependency
+# (backend/requirements.txt).
 # ============================================================
-# A router could call this to let the user download a PDF:
-#     GET /report/pdf  ->  render_pdf(state["report"])
-# Needs: pip install reportlab   (and add reportlab to requirements.txt)
 
 
-def render_pdf(report_markdown: str, filename: str = "nexora_report.pdf") -> str:
-    """Render the markdown report as a simple PDF. Returns the file path."""
+def render_pdf(report_markdown: str) -> bytes:
+    """Render the markdown report as a simple PDF, returned as bytes.
+
+    Returns bytes (not a file path) deliberately: this runs inside an HTTP
+    request handler, potentially concurrently for different threads/users --
+    writing to a shared filename on disk would race between requests and
+    leave files behind. reportlab's SimpleDocTemplate accepts a file-like
+    object just as happily as a path, so an in-memory BytesIO avoids both
+    problems.
+    """
+    import io
+    import html
+
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-    import html
 
     styles = getSampleStyleSheet()
     h1 = ParagraphStyle("h1", parent=styles["Heading1"], fontSize=16, spaceAfter=10)
     h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=13, spaceAfter=6)
     body = ParagraphStyle("body", parent=styles["Normal"], fontSize=10, leading=14)
 
+    buffer = io.BytesIO()
     doc = SimpleDocTemplate(
-        filename,
+        buffer,
         pagesize=A4,
         leftMargin=18 * mm,
         rightMargin=18 * mm,
@@ -256,4 +276,4 @@ def render_pdf(report_markdown: str, filename: str = "nexora_report.pdf") -> str
             story.append(Paragraph(text, body))
 
     doc.build(story)
-    return filename
+    return buffer.getvalue()

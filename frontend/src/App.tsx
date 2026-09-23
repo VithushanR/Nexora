@@ -2,8 +2,6 @@ import { useEffect, useState } from "react";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import Sidebar from "./components/Sidebar";
 import SearchPage from "./pages/SearchPage";
-import SelectionPage from "./pages/SelectionPage";
-import ReportPage from "./pages/ReportPage";
 import UploadPage from "./pages/UploadPage";
 import LoginPage from "./pages/LoginPage";
 import { AuthProvider, useAuth } from "./auth/AuthContext";
@@ -48,12 +46,8 @@ function AppShell({
 
   return (
     <div className="flex h-screen bg-slate-50 dark:bg-slate-950">
-      {/* Top-right status + theme toggle */}
+      {/* Top-right theme toggle */}
       <div className="fixed right-4 top-4 z-50 flex items-center gap-3">
-        <span className="hidden items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 shadow-sm dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400 sm:flex">
-          <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-          Research workspace
-        </span>
         <button
           onClick={() => setDark((d) => !d)}
           title={dark ? "Switch to light mode" : "Switch to dark mode"}
@@ -103,11 +97,15 @@ function AppShell({
       />
 
       {/* Main content */}
-      <main className="flex-1 overflow-y-auto">
+      <main className="flex-1 overflow-hidden">
         <Routes>
           <Route path="/" element={<SearchPage />} />
-          <Route path="/select/:runId" element={<SelectionPage />} />
-          <Route path="/report/:runId" element={<ReportPage />} />
+          {/* Item 4/5/7: search, selection, synthesis progress, and the
+              final report all render inside SearchPage as one persistent
+              chat thread -- /t/:threadId resumes an existing thread (e.g.
+              from "Saved research") into that same unified view, rather
+              than a separate selection/report page. */}
+          <Route path="/t/:threadId" element={<SearchPage />} />
           <Route path="/upload" element={<UploadPage />} />
         </Routes>
       </main>

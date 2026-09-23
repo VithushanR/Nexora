@@ -4,7 +4,7 @@ optional API key raises limits. Docs: https://api.semanticscholar.org/api-docs/g
 import os
 import logging
 import httpx
-from backend.sources.base import get_json, DEFAULT_HEADERS
+from backend.sources.base import get_json, strip_html_tags, DEFAULT_HEADERS
 
 logger = logging.getLogger("nexora.sources.semantic_scholar")
 
@@ -47,7 +47,7 @@ async def search(client: httpx.AsyncClient, query: str, limit: int = 15) -> list
         out.append({
             "title": p.get("title"),
             "doi": ext.get("DOI"),
-            "abstract": p.get("abstract") or "",
+            "abstract": strip_html_tags(p.get("abstract") or ""),
             "year": p.get("year"),
             "source": "semantic_scholar",
             "arxiv_id": ext.get("ArXiv"),

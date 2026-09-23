@@ -304,6 +304,7 @@ async def build_evidence_row(client: httpx.AsyncClient, paper: Candidate) -> dic
     return {
         "title": title,
         "doi": paper.get("doi") or "(none)",
+        "paper_url": paper.get("paper_url"),
         "year": paper.get("year"),
         "source": paper.get("source"),
         "full_text_available": full_text_available,
@@ -329,6 +330,7 @@ def _failed_row(paper: Candidate, error: Exception) -> dict:
     return {
         "title": paper.get("title") or "(untitled)",
         "doi": paper.get("doi") or "(none)",
+        "paper_url": paper.get("paper_url"),
         "year": paper.get("year"),
         "source": paper.get("source"),
         "full_text_available": False,

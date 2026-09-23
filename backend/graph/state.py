@@ -29,7 +29,9 @@ class Candidate(TypedDict, total=False):
     arxiv_id: Optional[str]
     pmcid: Optional[str]
     known_oa_pdf_url: Optional[str]
+    paper_url: Optional[str]        # best available link -- see agents/retrieval_screening.compute_paper_url
     prerank_score: float
+    relevance_percent: Optional[float]  # prerank_score scaled 0-100 relative to THIS batch's own top score
     verdict: str
     quote: str
     reason: str

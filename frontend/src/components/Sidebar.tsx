@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import GoogleSignInButton from "../auth/GoogleSignInButton";
@@ -9,6 +9,8 @@ interface HistoryEntry {
   timestamp: number;
 }
 
+const HISTORY_CHANGED_EVENT = "nexora-history-changed";
+
 export function getHistory(): HistoryEntry[] {
   try {
     return JSON.parse(localStorage.getItem("nexora_history") || "[]");
@@ -17,11 +19,36 @@ export function getHistory(): HistoryEntry[] {
   }
 }
 
+function writeHistory(history: HistoryEntry[]): void {
+  localStorage.setItem("nexora_history", JSON.stringify(history));
+  // SearchPage calls addHistory() directly (not through Sidebar's own
+  // state), and now that a Deep Search run never navigates away from
+  // SearchPage anymore, nothing else would otherwise tell Sidebar to
+  // re-read localStorage -- this event is that notification, for both
+  // additions and deletions.
+  window.dispatchEvent(new Event(HISTORY_CHANGED_EVENT));
+}
+
 export function addHistory(threadId: string, domain: string) {
   const history = getHistory().filter((h) => h.threadId !== threadId);
   history.unshift({ threadId, domain, timestamp: Date.now() });
   if (history.length > 50) history.length = 50;
-  localStorage.setItem("nexora_history", JSON.stringify(history));
+  writeHistory(history);
+}
+
+// Item 8: list-only removal -- deliberately does NOT delete the
+// underlying research thread/report on the backend. "Saved research" is
+// a per-browser convenience list (it was never synced with the backend
+// to begin with -- getHistory()/addHistory() are pure localStorage), and
+// there's no backend delete endpoint for threads today. Removing an
+// entry here just declutters this list; the actual research data (and
+// anyone else's ability to reference it) is untouched, which matches how
+// "clear history" works in most apps -- it doesn't imply "destroy the
+// underlying record." A real "delete my data" feature would be a
+// separate, deliberate addition (new backend endpoint + ownership
+// checks), not an implicit side effect of tidying a sidebar list.
+export function removeHistoryEntry(threadId: string) {
+  writeHistory(getHistory().filter((h) => h.threadId !== threadId));
 }
 
 export default function Sidebar() {
@@ -30,7 +57,15 @@ export default function Sidebar() {
   const { status, user, signOut } = useAuth();
   const [historyOpen, setHistoryOpen] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
-  const history = getHistory();
+  const [history, setHistory] = useState<HistoryEntry[]>(() => getHistory());
+
+  useEffect(() => {
+    function refresh() {
+      setHistory(getHistory());
+    }
+    window.addEventListener(HISTORY_CHANGED_EVENT, refresh);
+    return () => window.removeEventListener(HISTORY_CHANGED_EVENT, refresh);
+  }, []);
 
   const accountLabel = user?.name || user?.email || "Signed in";
   const accountInitial = accountLabel.charAt(0).toUpperCase();
@@ -123,14 +158,28 @@ export default function Sidebar() {
               <p className="py-2 text-xs text-slate-400">No searches yet</p>
             ) : (
               history.slice(0, 20).map((h) => (
-                <button
-                  key={h.threadId}
-                  onClick={() => navigate(`/report/${h.threadId}`)}
-                  className="block w-full truncate rounded-md px-2 py-1.5 text-left text-xs text-slate-500 transition hover:bg-slate-50 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
-                  title={h.domain}
-                >
-                  {h.domain}
-                </button>
+                <div key={h.threadId} className="group/history flex items-center rounded-md hover:bg-slate-50 dark:hover:bg-slate-800">
+                  <button
+                    onClick={() => navigate(`/t/${h.threadId}`)}
+                    className="block min-w-0 flex-1 truncate px-2 py-1.5 text-left text-xs text-slate-500 transition hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200"
+                    title={h.domain}
+                  >
+                    {h.domain}
+                  </button>
+                  <button
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      removeHistoryEntry(h.threadId);
+                    }}
+                    title="Remove from Saved research"
+                    aria-label={`Remove "${h.domain}" from Saved research`}
+                    className="shrink-0 rounded-md p-1.5 text-slate-300 opacity-0 transition hover:bg-red-50 hover:text-red-500 group-hover/history:opacity-100 dark:text-slate-600 dark:hover:bg-red-900/20 dark:hover:text-red-400"
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0-1 14a2 2 0 01-2 2H7a2 2 0 01-2-2L4 6h16z" />
+                    </svg>
+                  </button>
+                </div>
               ))
             )}
           </div>
