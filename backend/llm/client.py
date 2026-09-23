@@ -102,7 +102,8 @@ def reset_budget_flag_for_tests():
 
 
 async def llm_json_call(system_prompt: str, user_prompt: str, *,
-                         retries: int = 1, debug_label: str = "") -> Optional[dict]:
+                         retries: int = 1, debug_label: str = "",
+                         max_output_tokens: int = 4096) -> Optional[dict]:
     """
     Returns:
       - a parsed dict on success
@@ -116,6 +117,11 @@ async def llm_json_call(system_prompt: str, user_prompt: str, *,
     escalate a screening verdict to UNCERTAIN) rather than treating a
     failure as a clean empty result. See gaps_status / contradictions_status
     in the synthesis and gap-discovery agents for the pattern to follow.
+
+    max_output_tokens defaults to 4096 (the pipeline steps' report/
+    screening-sized budget) -- pass a smaller value for short, cheap calls
+    like casual chat (see routers/chat.py) rather than paying for headroom
+    a one-sentence reply will never use.
     """
     if _is_budget_exhausted():
         return {"_budget_exhausted": True}
@@ -129,7 +135,7 @@ async def llm_json_call(system_prompt: str, user_prompt: str, *,
     # GenerateContentConfigOrDict"). The typed object is unambiguous.
     config = genai_types.GenerateContentConfig(
         response_mime_type="application/json",
-        max_output_tokens=4096,
+        max_output_tokens=max_output_tokens,
         thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
         safety_settings=SAFETY_SETTINGS,
     )

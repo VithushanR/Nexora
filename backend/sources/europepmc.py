@@ -3,7 +3,7 @@ life-science full text -- flags OA availability directly in search results.
 Docs: https://europepmc.org/RestfulWebService"""
 
 import httpx
-from backend.sources.base import get_json
+from backend.sources.base import get_json, strip_html_tags
 
 BASE_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 
@@ -22,7 +22,10 @@ async def search(client: httpx.AsyncClient, query: str, page_size: int = 15) -> 
         out.append({
             "title": res.get("title"),
             "doi": res.get("doi"),
-            "abstract": res.get("abstractText") or "",
+            # abstractText commonly contains inline structural markup, e.g.
+            # "<h4>Methods</h4>...<h4>Results</h4>..." for structured
+            # abstracts -- confirmed against real Europe PMC responses.
+            "abstract": strip_html_tags(res.get("abstractText") or ""),
             "year": year,
             "source": "europepmc",
             "arxiv_id": None,

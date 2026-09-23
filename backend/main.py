@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import get_settings
-from backend.routers import auth, copilot, documents, research
+from backend.routers import auth, chat, copilot, documents, research
 
 # TODO: read allowed origins from config instead of hardcoding
 settings = get_settings()
@@ -32,6 +32,7 @@ app.include_router(research.router)
 app.include_router(copilot.router)
 app.include_router(documents.router)
 app.include_router(auth.router)
+app.include_router(chat.router)
 
 
 @app.get("/health")

@@ -485,7 +485,7 @@ def test_candidates_return_only_the_public_candidate_projection(router_environme
     assert "pmcid" not in candidate
     assert set(candidate) == {
         "title", "doi", "abstract", "year", "source", "verdict", "quote",
-        "reason", "prerank_score", "has_usable_abstract",
+        "reason", "paper_url", "prerank_score", "relevance_percent", "has_usable_abstract",
     }
 
 
@@ -591,6 +591,31 @@ def test_done_thread_without_report_returns_safe_server_error(router_environment
 
     assert response.status_code == 500
     assert response.json()["detail"] == "Research report is unavailable."
+
+
+def test_report_pdf_requires_done_status(router_environment):
+    thread = _paused_thread(router_environment)
+
+    with _client(router_environment) as client:
+        response = client.get(f"/research/{thread.thread_id}/report/pdf")
+
+    assert response.status_code == 404
+
+
+def test_report_pdf_returns_downloadable_pdf_when_done(router_environment):
+    thread = FakeThread("done-thread", "owner-1", "Test domain", "done")
+    router_environment.threads[thread.thread_id] = thread
+    router_environment.graph.interrupted = False
+    router_environment.graph.report = "# Completed report\n\nSome findings."
+
+    with _client(router_environment) as client:
+        response = client.get(f"/research/{thread.thread_id}/report/pdf")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/pdf"
+    assert "attachment" in response.headers["content-disposition"]
+    assert thread.thread_id in response.headers["content-disposition"]
+    assert response.content.startswith(b"%PDF")
 
 
 def test_start_rate_limit_rejects_the_eleventh_request(router_environment):

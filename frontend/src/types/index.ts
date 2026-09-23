@@ -37,7 +37,11 @@ export interface CandidatePaper {
   verdict: ScreeningVerdict | null;
   quote: string | null;
   reason: string | null;
+  paper_url: string | null;
   prerank_score: number | null;
+  // Relative to THIS search's own results only -- see backend's
+  // apply_relevance_percent(). Never comparable across two different searches.
+  relevance_percent: number | null;
   has_usable_abstract: boolean | null;
 }
 

@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from langgraph.types import Command
 
 from backend.auth.jwt import get_current_user
+# Kept importable as research.ResearchStartRateLimiter for backward
+# compatibility with existing tests -- see backend/rate_limit.py.
+from backend.rate_limit import RollingWindowRateLimiter as ResearchStartRateLimiter
 from backend.research_threads import (
     create_thread,
     get_thread,
@@ -92,7 +92,9 @@ class CandidateResponse(BaseModel):
     verdict: Literal["INCLUDE", "EXCLUDE", "UNCERTAIN"] | None = None
     quote: str | None = None
     reason: str | None = None
+    paper_url: str | None = None
     prerank_score: float | None = None
+    relevance_percent: float | None = None
     has_usable_abstract: bool | None = None
 
 
@@ -106,35 +108,6 @@ class SelectionResponse(BaseModel):
 
 class ReportResponse(BaseModel):
     report: str
-
-
-class ResearchStartRateLimiter:
-    """Small process-local rolling-window limiter for research starts.
-
-    It intentionally does not attempt distributed enforcement: timestamps are
-    lost after restart and are not shared across worker processes.
-    """
-
-    def __init__(self, limit: int = 10, window_seconds: float = 3600) -> None:
-        self.limit = limit
-        self.window_seconds = window_seconds
-        self._starts: dict[str, deque[float]] = defaultdict(deque)
-        self._lock = asyncio.Lock()
-
-    async def allow(self, user_id: str) -> bool:
-        now = time.monotonic()
-        async with self._lock:
-            starts = self._starts[user_id]
-            while starts and now - starts[0] >= self.window_seconds:
-                starts.popleft()
-            if len(starts) >= self.limit:
-                return False
-            starts.append(now)
-            return True
-
-    def reset(self) -> None:
-        """Clear process-local state; used only by isolated tests."""
-        self._starts.clear()
 
 
 _start_rate_limiter = ResearchStartRateLimiter()
@@ -366,3 +339,17 @@ async def research_report(thread_id: str, user_id: str = Depends(get_current_use
             detail="Research report is unavailable.",
         )
     return ReportResponse(report=report)
+
+
+@router.get("/{thread_id}/report/pdf")
+async def research_report_pdf(thread_id: str, user_id: str = Depends(get_current_user)) -> Response:
+    """Same report as GET /report, rendered as a downloadable PDF."""
+    from backend.agents.report_assembly import render_pdf
+
+    report_response = await research_report(thread_id, user_id)
+    pdf_bytes = render_pdf(report_response.report)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="nexora-report-{thread_id}.pdf"'},
+    )
