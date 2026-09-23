@@ -39,6 +39,7 @@ interface Message {
   role: "user" | "assistant";
   content: string;
   pages?: number[];
+  document?: DocumentUploadResponse;
   /** When set, this message renders as a ReportView card instead of plain/markdown text (item 7). */
   reportThreadId?: string;
   reportText?: string;
@@ -438,6 +439,10 @@ export default function SearchPage() {
     if (!trimmed || isThinking) return;
 
     setErrorMessage(null);
+    const pendingDocument =
+      doc && !messages.some((message) => message.document?.document_id === doc.document_id)
+        ? doc
+        : undefined;
 
     if (mode === "deep-search") {
       if (status !== "signed-in") {
@@ -447,7 +452,10 @@ export default function SearchPage() {
       }
       setNeedsSignIn(false);
 
-      setMessages((m) => [...m, { id: nextMessageId("u"), role: "user", content: trimmed }]);
+      setMessages((m) => [
+        ...m,
+        { id: nextMessageId("u"), role: "user", content: trimmed, document: pendingDocument },
+      ]);
       setInput("");
       setIsThinking(true);
       setProgressMessage("Starting research…");
@@ -484,7 +492,10 @@ export default function SearchPage() {
       // mid-conversation.
       const hasReport = deepSearchStage === "done" && threadId !== null;
 
-      setMessages((m) => [...m, { id: nextMessageId("u"), role: "user", content: trimmed }]);
+      setMessages((m) => [
+        ...m,
+        { id: nextMessageId("u"), role: "user", content: trimmed, document: pendingDocument },
+      ]);
       setInput("");
       setIsThinking(true);
       // Mode-specific progress text, set BEFORE isThinking is read by the
@@ -547,7 +558,7 @@ export default function SearchPage() {
           side gutters. Content now fills the box's actual width. */}
       <div>
         {/* Uploaded doc chip */}
-        {doc && (
+        {doc && !messages.some((message) => message.document?.document_id === doc.document_id) && (
           <div className="mb-2 flex items-center gap-2 rounded-xl bg-violet-50 px-3 py-2 dark:bg-violet-950/30">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" className="shrink-0 text-violet-500">
               <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
@@ -720,7 +731,19 @@ export default function SearchPage() {
             {messages.map((m) => (
               <div key={m.id} className="py-3">
                 {m.role === "user" ? (
-                  <div className="flex justify-end">
+                  <div className="flex flex-col items-end gap-2">
+                    {m.document && (
+                      <div className="flex w-[365px] max-w-[80%] items-center gap-2 rounded-xl bg-violet-50 px-3 py-2 dark:bg-violet-950/30">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" className="shrink-0 text-violet-500">
+                          <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+                          <path d="M14 2v6h6" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+                        </svg>
+                        <span className="min-w-0 flex-1 truncate text-left text-xs font-medium text-slate-700 dark:text-slate-300">
+                          {m.document.title}
+                        </span>
+                        <span className="shrink-0 text-[10px] text-slate-400">{m.document.n_pages} pages</span>
+                      </div>
+                    )}
                     <div className="max-w-[80%] rounded-2xl bg-slate-100 px-4 py-3 text-[15px] leading-relaxed text-slate-800 dark:bg-slate-800 dark:text-slate-200">
                       {m.content}
                     </div>
