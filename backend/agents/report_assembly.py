@@ -27,6 +27,7 @@ def merge_report(state: ResearchState) -> str:
     evidence_table = state.get("evidence_table")
     contradictions = state.get("contradictions")
     gaps = state.get("gaps")
+    paper_limitations = state.get("paper_limitations")
 
     missing = []
     if evidence_table is None:
@@ -35,6 +36,8 @@ def merge_report(state: ResearchState) -> str:
         missing.append("Conflicts")
     if gaps is None:
         missing.append("Research Gaps")
+    if paper_limitations is None:
+        missing.append("Limitations by Individual Paper")
 
     domain = state.get("domain", "Untitled search")
     selected = state.get("selected_papers") or []
@@ -56,6 +59,7 @@ def merge_report(state: ResearchState) -> str:
         render_contradictions(contradictions or [], state.get("contradictions_status"))
     )
     parts.append(render_gaps(gaps or [], state.get("gaps_status")))
+    parts.append(render_paper_limitations(paper_limitations or [], state.get("gaps_status")))
 
     return "\n".join(parts)
 
@@ -145,6 +149,33 @@ def render_gaps(gaps, status=None):
         )
         for quote in gap["quotes"]:
             lines.append(f"- *{quote['paper_id']}*: \"{quote['text']}\"")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_paper_limitations(paper_limitations, status=None):
+    """Render single-paper limitations that never reached MIN_SUPPORT.
+
+    Deliberately its own section, not folded into render_gaps(): a
+    limitation one paper stated about itself is not a recurring research
+    gap, and showing it under the same heading as gaps that ARE
+    corroborated by multiple independent papers would blur exactly the
+    distinction gap_discovery.py's MIN_SUPPORT threshold exists to draw.
+    """
+    if not paper_limitations:
+        return _render_empty_section(
+            "Limitations by Individual Paper", status,
+            "No individual paper limitations could be extracted.",
+        )
+
+    lines = [
+        "## Limitations by Individual Paper\n",
+        "*(Not corroborated across papers)*\n",
+    ]
+    for item in paper_limitations:
+        lines.append(f"**{item['paper_id']}**\n")
+        lines.append(f"- {item['statement']}")
         lines.append("")
 
     return "\n".join(lines)

@@ -3,10 +3,11 @@ Agent 4: Gap Discovery.
 
 Finds limitations that recur across several independent papers and reports
 them as candidate research gaps -- each with an exact support count and the
-source quotes behind it.
+source quotes behind it. Also surfaces, separately, single-paper limitations
+that never reached that cross-paper bar -- see paper_limitations below.
 
 Reads : state["selected_papers"]
-Writes: state["gaps"], state["gaps_status"]
+Writes: state["gaps"], state["paper_limitations"], state["gaps_status"]
 
 The pipeline runs in this order:
     1. Extract limitations from each paper   (3 layers, cheapest first)
@@ -18,15 +19,31 @@ The pipeline runs in this order:
     Limitation extraction itself uses three layers, each tried only when the
     one above finds nothing:
         Layer 1  heading detection   (free)  -- "5. Limitations" style sections
+                 accepted wholesale only for a heading dedicated to
+                 self-critique (STRICT_HEADINGS); a broader "Discussion" /
+                 "Future Work" heading only narrows *where* to phrase-match,
+                 since those sections mix in plain findings.
         Layer 2  phrase regex        (free)  -- buried admissions, no heading
-        Layer 3  LLM fallback        (paid)  -- last resort, then verified
+        Layer 3  LLM fallback        (paid)  -- last resort; the model must
+                 self-classify each candidate as is_limitation, and that is
+                 checked as a gate independent of the source-fidelity check
+
+    Clustering uses complete (max) linkage, not average: a cluster only
+    forms when every pair of statements inside it is within CLUSTER_DISTANCE
+    of each other, not merely similar on average -- this stops loosely
+    related statements (e.g. sharing only domain vocabulary such as
+    "churn"/"model") from chaining into one cluster and being reported as a
+    single shared gap.
 
         Note on input shape (confirmed against backend/graph/state.py):
             A Candidate has "title", "abstract", "doi", etc. -- there is no
-            "paper_id" and no "full_text" field. Identity uses "title". Full text
-            is not guaranteed to exist yet in this codebase (no fetcher has been
-            built), so extraction falls back to the abstract when full text is
-            unavailable.
+            "paper_id" and no "full_text" field, and Agent 3 does not write
+            the full text it fetches back into shared state (only derived
+            summaries), so none reaches this agent for free. Agent 4 fetches
+            its own full text via the same shared cascade Agent 3 uses
+            (backend/sources/fulltext.get_full_text) and falls back to the
+            abstract only when that cascade finds nothing. Identity uses
+            "title", since Candidate has no "paper_id".
 
             Note on the LLM client (confirmed against backend/llm/client.py):
                 The shared client exposes llm_json_call(system_prompt, user_prompt),
@@ -36,8 +53,11 @@ The pipeline runs in this order:
                 empty list here, since this is the last-resort extraction layer.
 """
 
+import os
 import re
+import asyncio
 
+import httpx
 import numpy as np
 from rapidfuzz import fuzz
 from sentence_transformers import SentenceTransformer
@@ -45,6 +65,7 @@ from sklearn.cluster import AgglomerativeClustering
 
 from backend.llm.client import llm_json_call
 from backend.graph.state import ResearchState
+from backend.sources.fulltext import get_full_text
 
 # ============================================================
 # CONFIGURATION
@@ -54,8 +75,14 @@ MAX_SECTION_CHARS = (
     4000  # after finding "Limitations", read only this many letters, then stop
 )
 CLUSTER_DISTANCE = 0.55  # how alike two complaints must be to count as the same one
-MIN_SUPPORT = 3  # a gap needs at least this many different papers to be real
+MIN_SUPPORT = 2  # a gap needs at least this many different papers to be real
 VERIFY_THRESHOLD = 80  # only trust the AI's sentence if it matches the paper 80%+
+
+# Same cascade Agent 3 uses, fetched independently since Agent 3 keeps its
+# full text local to build_evidence_row() and never writes it into shared
+# state. Bounded like Agent 3's own fetch: each paper costs up to seven HTTP
+# requests, so unbounded fan-out would breach source rate limits.
+PAPER_CONCURRENCY = int(os.getenv("GAP_DISCOVERY_PAPER_CONCURRENCY", "4"))
 
 EMBED_MODEL = "all-MiniLM-L6-v2"
 
@@ -71,6 +98,13 @@ HEADING_PATTERN = re.compile(
     r"\s*[:.]?\s*\n",
     re.IGNORECASE,
 )
+
+# Headings dedicated entirely to self-critique: every sentence under one of
+# these is fair game as-is. "Future Work"/"Discussion" headings are much
+# broader -- they mix ordinary findings in with any limitations -- so a
+# heading outside this set only narrows *where* to look for a phrase match,
+# it does not grant blanket acceptance (see extract_one).
+STRICT_HEADINGS = {"limitation", "limitations", "threats to validity"}
 
 NEXT_HEADING_PATTERN = re.compile(r"\n\s*\d+(?:\.\d+)*\.?\s+[A-Z]")
 
@@ -111,13 +145,22 @@ def embed(statements):
 
 
 def find_limitations_section(full_text):
-    """Return the text under a Limitations heading, or None if not found."""
+    """Return (heading, text) under a Limitations-style heading, or (None, None).
+
+    The heading is returned (lowercased) alongside the text so the caller
+    can tell a dedicated "Limitations"/"Threats to Validity" section --
+    safe to accept wholesale -- from a broader "Discussion"/"Future Work"
+    section, which also contains plain findings and must be filtered
+    further rather than accepted verbatim.
+    """
     if not full_text:
-        return None
+        return None, None
 
     match = HEADING_PATTERN.search(full_text)
     if not match:
-        return None
+        return None, None
+
+    heading = match.group(1).strip().lower()
 
     start = match.end()
     tail = full_text[start : start + MAX_SECTION_CHARS]
@@ -127,7 +170,7 @@ def find_limitations_section(full_text):
         tail = tail[: stop.start()]
 
     tail = tail.strip()
-    return tail or None
+    return (heading, tail) if tail else (None, None)
 
 
 def split_sentences(block):
@@ -162,12 +205,22 @@ def find_by_phrases(full_text):
 # ============================================================
 
 EXTRACT_SYSTEM_PROMPT = (
-    "You extract limitations from academic paper text. Extract only "
-    "limitations the authors explicitly state about their OWN work. Copy "
-    "their wording closely. Do not infer, summarise, or invent limitations. "
-    "If the text states none, return an empty list.\n\n"
+    "You extract limitations from academic paper text. A limitation is a "
+    "shortcoming, constraint, or unaddressed issue the authors explicitly "
+    "admit about their OWN work -- e.g. a small or single-source dataset, "
+    "untested generalisation, a case the method does not handle, something "
+    "left for future work.\n\n"
+    "Do NOT extract reported results, performance numbers or comparisons, "
+    "or descriptions of what the model/method achieved -- those are "
+    "findings, not limitations, even when they sound analytical or "
+    "critical in tone. Most sentences in a paper are findings, not "
+    "limitations; returning few or zero items is expected and correct.\n\n"
+    "For every candidate you extract, set is_limitation to true only if it "
+    "genuinely fits the definition above. Copy wording closely. Do not "
+    "infer, summarise, or invent. If the text states no limitations, "
+    "return an empty list.\n\n"
     "Respond ONLY with valid JSON, no markdown fences: "
-    '{"items": ["...", "..."]}'
+    '{"items": [{"statement": "...", "is_limitation": true}]}'
 )
 
 EXTRACT_USER_PROMPT = (
@@ -196,6 +249,13 @@ async def find_by_llm(full_text):
     _blocked_or_empty -- which must be treated as "could not check", not
     as "found nothing". Both degrade to an empty list here since this is
     already the last-resort layer; there is no further fallback.
+
+    verify_against_source is an anti-*hallucination* gate only -- it
+    confirms the string is really in the source, not that it is really a
+    limitation. is_limitation is the model's own affirmative classification
+    (see EXTRACT_SYSTEM_PROMPT) and is checked here as a second, independent
+    gate: a real quote that the model itself did not mark as a limitation
+    (e.g. a reported result) is discarded just as a fabricated one would be.
     """
     if not full_text:
         return []
@@ -214,8 +274,16 @@ async def find_by_llm(full_text):
         return []
 
     verified = []
-    for statement in items:
-        statement = str(statement).strip()
+    for item in items:
+        if isinstance(item, dict):
+            if item.get("is_limitation") is not True:
+                continue
+            statement = str(item.get("statement", "")).strip()
+        else:
+            # Tolerate a plain string in case the model ignores the
+            # requested shape -- there is no classification to check in
+            # that case, so it only gets the source-fidelity gate.
+            statement = str(item).strip()
         if len(statement) >= 30 and verify_against_source(statement, full_text):
             verified.append(statement)
 
@@ -227,33 +295,64 @@ async def find_by_llm(full_text):
 # ============================================================
 
 
+async def extract_one(client, paper):
+    """Fetch one paper's text and run the three extraction layers on it.
+
+    Identity uses "title" (Candidate has no "paper_id"). Text prefers real
+    full text fetched via the same cascade Agent 3 uses, falling back to
+    "abstract" only when that cascade finds nothing -- abstracts rarely
+    state limitations explicitly, so this fallback is a last resort, not
+    the common case.
+    """
+    paper_id = paper.get("title")
+
+    full_text, _strategy = await get_full_text(client, dict(paper))
+    text = full_text or paper.get("abstract", "")
+
+    # Layer 1: heading
+    heading, section = find_limitations_section(text)
+
+    if section and heading in STRICT_HEADINGS:
+        # A section dedicated entirely to self-critique -- every sentence
+        # in it is fair game, no further filtering needed.
+        statements = split_sentences(section)
+    else:
+        # Either no heading was found, or only a broader "Discussion" /
+        # "Future Work" heading was -- those sections mix plain findings
+        # in with any limitations, so accepting them wholesale (like a
+        # real Limitations section) would let findings through labelled
+        # as limitations. Narrow to phrase-matched sentences instead,
+        # preferring the located section (most likely spot) before
+        # falling back to the whole text, then to the LLM as a last resort.
+        statements = find_by_phrases(section) if section else []
+        if not statements:
+            statements = find_by_phrases(text)
+        if not statements:
+            statements = await find_by_llm(text)
+
+    return [(paper_id, sentence) for sentence in statements]
+
+
 async def extract_limitations(papers):
     """Collect (paper_id, statement) tuples from every paper.
 
-    Identity uses "title" (Candidate has no "paper_id"). Text uses
-    "full_text" if present, else falls back to "abstract". Papers with
-    nothing extractable are skipped silently -- they still contribute to
-    Agent 3's evidence table.
+    Papers with nothing extractable are skipped silently -- they still
+    contribute to Agent 3's evidence table. Fetches run with bounded
+    concurrency (PAPER_CONCURRENCY) since each paper's full-text lookup can
+    cost up to seven HTTP requests.
     """
     found = []
+    semaphore = asyncio.Semaphore(PAPER_CONCURRENCY)
 
-    for paper in papers:
-        paper_id = paper.get("title")
-        text = paper.get("full_text") or paper.get("abstract", "")
+    async def _bounded(client, paper):
+        async with semaphore:
+            return await extract_one(client, paper)
 
-        # Layer 1: heading
-        section = find_limitations_section(text)
-        if section:
-            statements = split_sentences(section)
-        else:
-            # Layer 2: phrase regex
-            statements = find_by_phrases(text)
-            # Layer 3: LLM, only if both free layers found nothing
-            if not statements:
-                statements = await find_by_llm(text)
+    async with httpx.AsyncClient() as client:
+        results = await asyncio.gather(*(_bounded(client, paper) for paper in papers))
 
-        for sentence in statements:
-            found.append((paper_id, sentence))
+    for statements in results:
+        found.extend(statements)
 
     return found
 
@@ -285,7 +384,17 @@ def cluster_limitations(limitations):
         n_clusters=None,  # pyright: ignore[reportArgumentType]
         distance_threshold=CLUSTER_DISTANCE,
         metric="cosine",
-        linkage="average",
+        # "complete" (max) linkage, not "average": average linkage merges
+        # two clusters whenever their MEAN distance clears the threshold,
+        # which lets loosely-related statements chain together through
+        # intermediate members even when some pairs in the resulting
+        # cluster are unrelated -- exactly how off-topic findings from
+        # different papers ended up sharing a "gap" that shared only
+        # domain vocabulary (e.g. "churn", "model") in practice. Complete
+        # linkage requires every pair within a cluster to be within
+        # CLUSTER_DISTANCE of each other, so a cluster only forms when its
+        # members are mutually similar, not just similar on average.
+        linkage="complete",
     ).fit_predict(vectors)
 
     clusters = {}
@@ -360,24 +469,55 @@ def build_gaps(survivors, total_papers):
     return gaps
 
 
+def build_paper_limitations(limitations):
+    """One representative, verbatim limitation per paper -- independent of
+    clustering/support counting.
+
+    These are single-paper limitations that may never have been corroborated
+    by any other paper (indeed this runs even when nothing clears
+    MIN_SUPPORT). They must not be confused with a "Research Gap": a gap
+    means multiple independent papers hit the same wall, this means one
+    paper admitted one thing. Kept verbatim -- not summarised or paraphrased
+    -- for the same anti-hallucination reason every other statement in this
+    module is: it was already verified against its source, and paraphrasing
+    it here would throw that verification away.
+
+    When a paper has several extracted statements, the SHORTEST one is
+    picked as the representative: still verbatim, but a short admission
+    reads more like a single clean point than a long, hedge-heavy one.
+    """
+    by_paper = {}
+    for paper_id, statement in limitations:
+        by_paper.setdefault(paper_id, []).append(statement)
+
+    return [
+        {"paper_id": paper_id, "statement": min(statements, key=len)}
+        for paper_id, statements in by_paper.items()
+    ]
+
+
 # ============================================================
 # LANGGRAPH NODE (the entry point)
 # ============================================================
 
 
 async def gap_discovery_node(state: ResearchState) -> dict:
-    """LangGraph node. Reads selected_papers, writes gaps + gaps_status.
+    """LangGraph node. Reads selected_papers, writes gaps + paper_limitations
+    + gaps_status.
 
-    gaps_status records WHY the list is empty, so the report can tell an
-    honest "nothing found" apart from a genuine processing failure.
-    Returns an empty list when nothing clears the threshold -- never a
-    fabricated gap.
+    gaps_status records WHY gaps/paper_limitations are empty, so the report
+    can tell an honest "nothing found" apart from a genuine processing
+    failure. gaps is empty unless a limitation cleared MIN_SUPPORT distinct
+    papers -- never a fabricated gap. paper_limitations is populated
+    whenever ANY limitation was extracted, independent of that threshold --
+    see build_paper_limitations for why these are kept separate from gaps.
     """
     papers = state.get("selected_papers") or []
 
     if not papers:
         return {
             "gaps": [],
+            "paper_limitations": [],
             "gaps_status": {
                 "code": "no_papers",
                 "message": "No papers were selected, so no gaps could be mined.",
@@ -390,6 +530,7 @@ async def gap_discovery_node(state: ResearchState) -> dict:
     if not limitations:
         return {
             "gaps": [],
+            "paper_limitations": [],
             "gaps_status": {
                 "code": "no_statements",
                 "message": (
@@ -400,6 +541,8 @@ async def gap_discovery_node(state: ResearchState) -> dict:
             },
         }
 
+    paper_limitations = build_paper_limitations(limitations)
+
     clusters = cluster_limitations(limitations)
     survivors = apply_threshold(clusters)
     gaps = build_gaps(survivors, len(papers))
@@ -407,6 +550,7 @@ async def gap_discovery_node(state: ResearchState) -> dict:
     if not gaps:
         return {
             "gaps": [],
+            "paper_limitations": paper_limitations,
             "gaps_status": {
                 "code": "none_met_threshold",
                 "message": (
@@ -419,6 +563,7 @@ async def gap_discovery_node(state: ResearchState) -> dict:
 
     return {
         "gaps": gaps,
+        "paper_limitations": paper_limitations,
         "gaps_status": {
             "code": "ok",
             "message": f"{len(gaps)} candidate gap(s) surfaced.",

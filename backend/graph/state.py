@@ -7,7 +7,7 @@ only the fields it owns:
   Agent 2 -> candidates
   [human]  -> selected_papers  (via interrupt())
   Agent 3 -> evidence_table, contradictions
-  Agent 4 -> gaps
+  Agent 4 -> gaps, paper_limitations
   Report Assembly -> report  (no LLM call, merges 3 + 4)
 """
 
@@ -54,5 +54,6 @@ class ResearchState(TypedDict, total=False):
     contradictions: Optional[list[dict]]
     contradictions_status: Optional[dict]
     gaps: Optional[list[dict]]
+    paper_limitations: Optional[list[dict]]
     gaps_status: Optional[dict]
     report: Optional[str]
