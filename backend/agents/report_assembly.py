@@ -531,7 +531,7 @@ def render_pdf(report_markdown: str) -> bytes:
     """
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_CENTER, TA_LEFT
-    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
     from reportlab.platypus import (
@@ -647,7 +647,7 @@ def render_pdf(report_markdown: str) -> bytes:
         textColor=slate_900,
     )
 
-    page_size = landscape(A4)
+    page_size = A4
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,

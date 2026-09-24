@@ -50,12 +50,14 @@ No contradictions detected.
 
     assert pdf_bytes.startswith(b"%PDF")
     assert len(reader.pages) >= 2
-    assert float(reader.pages[0].mediabox.width) > float(reader.pages[0].mediabox.height)
+    assert float(reader.pages[0].mediabox.width) < float(reader.pages[0].mediabox.height)
 
     page_text = [page.extract_text() or "" for page in reader.pages]
     combined_text = "\n".join(page_text)
     assert all("Nexora Research" in text for text in page_text)
-    assert all("Paper" in text and "Key finding" in text for text in page_text)
+    evidence_pages = [text for text in page_text if "Evidence paper" in text]
+    assert len(evidence_pages) >= 2
+    assert all("Paper" in text and "Key finding" in text for text in evidence_pages)
     assert "Introduction" in combined_text
     assert "Evidence Table" in combined_text
     assert "| ---" not in combined_text
