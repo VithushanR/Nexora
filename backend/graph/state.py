@@ -54,6 +54,7 @@ class ResearchState(TypedDict, total=False):
     contradictions: Optional[list[dict]]
     contradictions_status: Optional[dict]
     gaps: Optional[list[dict]]
+    paper_limitations: Optional[list[dict]]
     gaps_status: Optional[dict]
     introduction: Optional[str]
     introduction_status: Optional[dict]
