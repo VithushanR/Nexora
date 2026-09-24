@@ -8,7 +8,7 @@ only the fields it owns:
   [human]  -> selected_papers  (via interrupt())
   Agent 3 -> evidence_table, contradictions
   Agent 4 -> gaps
-  Report Assembly -> report  (no LLM call, merges 3 + 4)
+  Report Assembly -> introduction, introduction_status, report
 """
 
 from typing import TypedDict, Optional, Literal
@@ -55,4 +55,6 @@ class ResearchState(TypedDict, total=False):
     contradictions_status: Optional[dict]
     gaps: Optional[list[dict]]
     gaps_status: Optional[dict]
+    introduction: Optional[str]
+    introduction_status: Optional[dict]
     report: Optional[str]
