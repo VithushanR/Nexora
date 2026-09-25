@@ -18,7 +18,7 @@ export default function GoogleSignInButton({ width = 220 }: GoogleSignInButtonPr
     window.google.accounts.id.renderButton(containerRef.current, {
       type: "standard",
       theme: "outline",
-      size: "medium",
+      size: "large",
       width,
     });
   }, [scriptReady, width]);

@@ -276,7 +276,13 @@ def cluster_limitations(limitations):
     vectors = embed(statements)
 
     labels = AgglomerativeClustering(
-        n_clusters=None,
+        # n_clusters=None is sklearn's own documented API for this: "It must
+        # be None if distance_threshold is not None" -- confirmed against
+        # the installed sklearn 1.9.0's real __init__ signature
+        # (n_clusters=2 default, no runtime type enforcement). The installed
+        # type stub declares n_clusters as plain `int`, which is simply
+        # incomplete for this constructor -- not a bug in this call.
+        n_clusters=None,  # pyright: ignore[reportArgumentType]
         distance_threshold=CLUSTER_DISTANCE,
         metric="cosine",
         linkage="average",

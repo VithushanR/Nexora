@@ -2,7 +2,7 @@
 rate tier. Docs: https://docs.openalex.org/api-entities/works"""
 
 import httpx
-from backend.sources.base import get_json, CONTACT_EMAIL, SourceUnavailableError
+from backend.sources.base import get_json, strip_html_tags, CONTACT_EMAIL, SourceUnavailableError
 
 BASE_URL = "https://api.openalex.org/works"
 
@@ -14,7 +14,11 @@ def _reconstruct_abstract(inverted_index: dict | None) -> str:
     for word, idxs in inverted_index.items():
         for i in idxs:
             positions[i] = word
-    return " ".join(positions[i] for i in sorted(positions))
+    # Individual tokens can themselves be literal tag fragments (e.g.
+    # "<h4>Methods</h4>") when the underlying publisher text was
+    # JATS-tagged -- strip after reassembly, not per-token, since a tag can
+    # span what were originally multiple whitespace-separated tokens.
+    return strip_html_tags(" ".join(positions[i] for i in sorted(positions)))
 
 
 async def search(client: httpx.AsyncClient, query: str, per_page: int = 15) -> list[dict]:

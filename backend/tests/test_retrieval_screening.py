@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 from backend.agents.retrieval_screening import (
     dedupe, prerank_and_cap, screen_candidate, sort_by_verdict,
     retrieve_all_sources, run_retrieval_and_screening,
+    compute_paper_url, apply_relevance_percent,
 )
 from backend.sources.base import SourceUnavailableError
 from backend.graph.state import Candidate, Protocol
@@ -97,6 +98,69 @@ def test_cap_orders_by_prerank_score_descending():
 
 def test_empty_candidate_list_returns_empty():
     assert prerank_and_cap([], PROTOCOL) == []
+
+
+# ------------------------------------------------------------------
+# paper_url -- priority order: known_oa_pdf_url -> arxiv -> doi -> pmc -> None
+# ------------------------------------------------------------------
+
+def test_paper_url_prefers_known_oa_pdf_url():
+    c = make_candidate(known_oa_pdf_url="https://example.com/x.pdf", arxiv_id="1234.5678",
+                        doi="10.1/x", pmcid="PMC1")
+    assert compute_paper_url(c) == "https://example.com/x.pdf"
+
+
+def test_paper_url_falls_back_to_arxiv_abstract_page():
+    c = make_candidate(known_oa_pdf_url=None, arxiv_id="1234.5678", doi="10.1/x", pmcid="PMC1")
+    assert compute_paper_url(c) == "https://arxiv.org/abs/1234.5678"
+
+
+def test_paper_url_falls_back_to_doi_resolver():
+    c = make_candidate(known_oa_pdf_url=None, arxiv_id=None, doi="10.1/x", pmcid="PMC1")
+    assert compute_paper_url(c) == "https://doi.org/10.1/x"
+
+
+def test_paper_url_falls_back_to_pmc():
+    c = make_candidate(known_oa_pdf_url=None, arxiv_id=None, doi=None, pmcid="PMC1")
+    assert compute_paper_url(c) == "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1/"
+
+
+def test_paper_url_is_none_when_no_identifier_available():
+    c = make_candidate(known_oa_pdf_url=None, arxiv_id=None, doi=None, pmcid=None)
+    assert compute_paper_url(c) is None
+
+
+# ------------------------------------------------------------------
+# relevance_percent -- relative to THIS batch's own top score only
+# ------------------------------------------------------------------
+
+def test_relevance_percent_top_candidate_is_100():
+    candidates = [
+        make_candidate(prerank_score=10.0),
+        make_candidate(prerank_score=5.0),
+    ]
+    apply_relevance_percent(candidates)
+    assert candidates[0].get("relevance_percent") == 100
+
+
+def test_relevance_percent_half_score_candidate_is_about_50():
+    candidates = [
+        make_candidate(prerank_score=10.0),
+        make_candidate(prerank_score=5.0),
+    ]
+    apply_relevance_percent(candidates)
+    assert candidates[1].get("relevance_percent") == 50
+
+
+def test_relevance_percent_zero_max_score_does_not_crash():
+    candidates = [make_candidate(prerank_score=0.0), make_candidate(prerank_score=0.0)]
+    apply_relevance_percent(candidates)  # must not raise ZeroDivisionError
+    assert candidates[0].get("relevance_percent") is None
+    assert candidates[1].get("relevance_percent") is None
+
+
+def test_relevance_percent_empty_batch_does_not_crash():
+    assert apply_relevance_percent([]) == []
 
 
 # ------------------------------------------------------------------

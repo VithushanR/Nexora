@@ -4,7 +4,7 @@ shared arxiv rate limiter in base.py)."""
 
 import xml.etree.ElementTree as ET
 import httpx
-from backend.sources.base import get_text
+from backend.sources.base import get_text, strip_html_tags
 
 BASE_URL = "https://export.arxiv.org/api/query"
 _NS = {"atom": "http://www.w3.org/2005/Atom"}
@@ -45,7 +45,7 @@ async def search(client: httpx.AsyncClient, query: str, max_results: int = 15) -
         out.append({
             "title": title_el.text.strip().replace("\n", " "),
             "doi": None,
-            "abstract": summary_el.text.strip().replace("\n", " "),
+            "abstract": strip_html_tags(summary_el.text.strip().replace("\n", " ")),
             "year": year,
             "source": "arxiv",
             "arxiv_id": arxiv_id,

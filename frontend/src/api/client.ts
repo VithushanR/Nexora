@@ -297,6 +297,31 @@ export async function getResearchReport(threadId: string): Promise<ReportRespons
   return response;
 }
 
+// GET /report/pdf returns a binary PDF, not JSON -- requestJson() always
+// parses the body as JSON, so this needs its own fetch (same auth-header
+// attachment as everywhere else, via authHeadersProvider).
+export async function downloadResearchReportPdf(threadId: string): Promise<Blob> {
+  const authHeaders = authHeadersProvider ? await authHeadersProvider() : {};
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(authHeaders)) {
+    headers.set(name, value);
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${getBaseUrl()}${researchPath(threadId, "/report/pdf")}`, { headers });
+  } catch {
+    throw new ApiNetworkError("Unable to connect to the research service.");
+  }
+
+  if (!response.ok) {
+    const payload = await parseJson(response);
+    const detail = responseDetail(payload, "The report PDF could not be downloaded.");
+    throw new ApiClientError(response.status, detail.message, detail.code);
+  }
+  return response.blob();
+}
+
 // ---------------------------------------------------------------------------
 // Report Copilot (backend/routers/copilot.py). Response shapes match that
 // router's Pydantic models exactly -- see types/index.ts.
@@ -334,6 +359,23 @@ export async function addToEvidence(
 
 export async function getCopilotHistory(threadId: string): Promise<CopilotHistoryEntry[]> {
   return requestJson<CopilotHistoryEntry[]>(researchPath(threadId, "/copilot/history"));
+}
+
+// ---------------------------------------------------------------------------
+// General chat (backend/routers/chat.py) -- no document, no research
+// thread. Used by Chat mode when there's nothing yet to ground a response
+// in; a real (Gemini-backed) but short, scoped reply, not a canned string.
+// ---------------------------------------------------------------------------
+
+export interface GeneralChatResponse {
+  reply: string;
+}
+
+export async function sendGeneralChat(message: string): Promise<GeneralChatResponse> {
+  return requestJson<GeneralChatResponse>("/chat", {
+    method: "POST",
+    body: JSON.stringify({ message }),
+  });
 }
 
 // ---------------------------------------------------------------------------

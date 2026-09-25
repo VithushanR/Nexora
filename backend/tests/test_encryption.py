@@ -58,11 +58,14 @@ class TestInvalidInput:
 
     def test_encrypt_rejects_non_bytes(self):
         with pytest.raises(TypeError):
-            encrypt_bytes("not bytes, a string")
+            # Deliberately wrong type -- this test exists to verify the
+            # runtime rejection itself, not to be type-correct.
+            encrypt_bytes("not bytes, a string")  # pyright: ignore[reportArgumentType]
 
     def test_decrypt_rejects_non_bytes(self):
         with pytest.raises(TypeError):
-            decrypt_bytes("not bytes, a string")
+            # Deliberately wrong type -- see test_encrypt_rejects_non_bytes above.
+            decrypt_bytes("not bytes, a string")  # pyright: ignore[reportArgumentType]
 
 
 class TestTamperDetection:

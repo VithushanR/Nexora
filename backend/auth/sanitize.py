@@ -9,7 +9,9 @@ Called by: Part A, Part B, Part D — anywhere untrusted text (chat messages,
            extracted PDF text, report chunks) is concatenated into a prompt.
 
 Public surface (do not rename without telling A/B):
-    sanitize_for_prompt(text: str) -> str
+    sanitize_for_prompt(text: str | None) -> str | None
+    (accepts/returns None as a defensive passthrough -- see test_sanitize.py's
+    test_none_safe_passthrough for callers that pass it accidentally)
 
 What this defends against:
     Prompt injection — text crafted to look like a new instruction rather
@@ -37,6 +39,7 @@ rather than text just vanishing with no trace.
 """
 
 import re
+from typing import Optional, overload
 
 # ---------------------------------------------------------------------------
 # Fake role / delimiter markers
@@ -96,7 +99,11 @@ _INJECTION_PATTERN = re.compile(
 _REDACTION_MARKER = "[neutralized]"
 
 
-def sanitize_for_prompt(text: str) -> str:
+@overload
+def sanitize_for_prompt(text: None) -> None: ...
+@overload
+def sanitize_for_prompt(text: str) -> str: ...
+def sanitize_for_prompt(text: Optional[str]) -> Optional[str]:
     """
     Neutralize prompt-injection patterns in untrusted text before it is
     concatenated into any LLM prompt.
@@ -117,12 +124,14 @@ def sanitize_for_prompt(text: str) -> str:
 
     Args:
         text: Raw, untrusted text (chat message, extracted PDF text,
-              report chunk, etc.)
+              report chunk, etc.). None is accepted defensively for
+              callers that pass it accidentally -- passed straight through.
 
     Returns:
         Sanitized text, safe to concatenate into a prompt template.
         Callers are still responsible for clearly delimiting this text
-        from actual instructions in their prompt structure.
+        from actual instructions in their prompt structure. None in,
+        None out.
     """
     if not text:
         return text

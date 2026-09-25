@@ -1,8 +1,10 @@
 """Focused tests for the human candidate-selection checkpoint."""
 
+from typing import cast
 from unittest.mock import patch
 
 import pytest
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
@@ -11,14 +13,17 @@ from backend.agents.human_selection import (
     HumanSelectionValidationError,
     human_selection_node,
 )
-from backend.graph.state import ResearchState
+from backend.graph.state import Candidate, ResearchState
 
 
-CANDIDATES = [
+# cast() here, not a plain list[dict] literal, for the same reason as
+# test_retrieval_screening.py's make_candidate(): this is a known-valid
+# Candidate shape built by hand for tests, not runtime-uncertain data.
+CANDIDATES = cast(list[Candidate], [
     {"title": "Paper zero", "abstract": "Abstract zero", "source": "openalex"},
     {"title": "Paper one", "abstract": "Abstract one", "source": "arxiv"},
     {"title": "Paper two", "abstract": "Abstract two", "source": "europepmc"},
-]
+])
 
 
 @pytest.mark.asyncio
@@ -86,7 +91,7 @@ async def test_isolated_graph_pauses_and_resumes_with_selected_indices():
     graph.add_edge(START, "human_selection")
     graph.add_edge("human_selection", END)
     app = graph.compile(checkpointer=MemorySaver())
-    config = {"configurable": {"thread_id": "human-selection-test"}}
+    config = cast(RunnableConfig, {"configurable": {"thread_id": "human-selection-test"}})
 
     paused = await app.ainvoke({"candidates": CANDIDATES}, config=config)
     interrupt_payload = paused["__interrupt__"][0].value

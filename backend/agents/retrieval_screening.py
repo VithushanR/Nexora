@@ -32,6 +32,7 @@ import re
 import asyncio
 import logging
 from difflib import SequenceMatcher
+from typing import Optional
 
 import httpx
 from rank_bm25 import BM25Okapi
@@ -159,6 +160,29 @@ def dedupe(candidates: list[Candidate]) -> list[Candidate]:
 
 
 # ------------------------------------------------------------------
+# Best available link, priority order: an actual OA PDF, then arXiv's own
+# abstract page, then the DOI resolver, then PubMed Central. None of these
+# are fabricated -- a candidate with none of the underlying identifiers
+# gets None, never a guessed URL.
+# ------------------------------------------------------------------
+
+def compute_paper_url(candidate: Candidate) -> Optional[str]:
+    known_oa_pdf_url = candidate.get("known_oa_pdf_url")
+    if known_oa_pdf_url:
+        return known_oa_pdf_url
+    arxiv_id = candidate.get("arxiv_id")
+    if arxiv_id:
+        return f"https://arxiv.org/abs/{arxiv_id}"
+    doi = candidate.get("doi")
+    if doi:
+        return f"https://doi.org/{doi}"
+    pmcid = candidate.get("pmcid")
+    if pmcid:
+        return f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
+    return None
+
+
+# ------------------------------------------------------------------
 # Step 3-4: BM25 pre-rank + cap (deterministic, no LLM)
 # ------------------------------------------------------------------
 
@@ -176,6 +200,31 @@ def prerank_and_cap(candidates: list[Candidate], protocol: Protocol, cap: int = 
 
     ranked = sorted(candidates, key=lambda c: c.get("prerank_score", 0.0), reverse=True)
     return ranked[:cap]
+
+
+def apply_relevance_percent(candidates: list[Candidate]) -> list[Candidate]:
+    """Scales prerank_score to a 0-100 relevance percentage RELATIVE TO THIS
+    BATCH ONLY -- BM25 has no fixed ceiling and is corpus-relative, so a raw
+    score is meaningless to a user and not comparable across two different
+    searches. The top-scoring candidate in `candidates` becomes 100%; every
+    other candidate is scaled against that same batch max, computed once
+    here rather than per-candidate in isolation.
+
+    If every candidate scored 0 against the inclusion criteria (the
+    divide-by-zero case), relevance_percent is left as None for the whole
+    batch rather than showing a misleading 0% or crashing -- the frontend
+    shows "No strong match found" for that case.
+    """
+    if not candidates:
+        return candidates
+
+    max_score = max((c.get("prerank_score", 0.0) for c in candidates), default=0.0)
+    for c in candidates:
+        if max_score <= 0:
+            c["relevance_percent"] = None
+        else:
+            c["relevance_percent"] = round((c.get("prerank_score", 0.0) / max_score) * 100)
+    return candidates
 
 
 # ------------------------------------------------------------------
@@ -265,9 +314,15 @@ async def run_retrieval_and_screening(protocol: Protocol) -> list[Candidate]:
 
     deduped = dedupe(raw)
     logger.info("Deduped: %d -> %d", len(raw), len(deduped))
+    for c in deduped:
+        c["paper_url"] = compute_paper_url(c)
 
     capped = prerank_and_cap(deduped, protocol)
     logger.info("Capped to top %d of %d for LLM screening", len(capped), len(deduped))
+    # Relative to this batch's own top score only -- see apply_relevance_percent's
+    # docstring. Computed once here, after every candidate that will ever reach
+    # the user (the capped set) has its final prerank_score.
+    apply_relevance_percent(capped)
 
     screened = await screen_all(capped, protocol)
 

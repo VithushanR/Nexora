@@ -34,12 +34,18 @@ from fastapi.security import OAuth2PasswordBearer
 # Config — fail loudly, no silent fallback secret
 # ---------------------------------------------------------------------------
 
-JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY")
-if not JWT_SECRET_KEY:
+_raw_jwt_secret_key = os.environ.get("JWT_SECRET_KEY")
+if not _raw_jwt_secret_key:
     raise RuntimeError(
         "JWT_SECRET_KEY is not set. Refusing to start with no signing secret. "
         "Set JWT_SECRET_KEY in your environment or .env file."
     )
+# Re-bound to a `str`-typed name after the guard above: os.environ.get()
+# alone types this as `str | None`, and jwt.encode()/decode() require a
+# non-optional key. The guard already makes None impossible here at
+# runtime -- this just gives that guarantee a type pyright can see too,
+# instead of a cast that would silently accept a real None.
+JWT_SECRET_KEY: str = _raw_jwt_secret_key
 
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_MINUTES = int(os.environ.get("JWT_EXPIRY_MINUTES", "60"))

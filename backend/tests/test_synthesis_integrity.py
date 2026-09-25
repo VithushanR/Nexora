@@ -22,7 +22,7 @@ from backend.agents.synthesis_integrity import (
     build_evidence_row, build_evidence_table, synthesis_integrity_node,
 )
 from backend.sources.crossref import check_retraction
-from backend.graph.state import Candidate
+from backend.graph.state import Candidate, ResearchState
 
 AGENT = "backend.agents.synthesis_integrity"
 
@@ -447,7 +447,7 @@ async def test_node_writes_only_the_three_fields_it_owns():
          patch(f"{AGENT}.detect_contradictions",
                new=AsyncMock(return_value=([], {"code": "too_few_papers", "is_error": False,
                                                 "message": "m"}))):
-        result = await synthesis_integrity_node(cast(dict, state))
+        result = await synthesis_integrity_node(cast(ResearchState, state))
 
     assert set(result) == {"evidence_table", "contradictions", "contradictions_status"}
 
@@ -455,7 +455,7 @@ async def test_node_writes_only_the_three_fields_it_owns():
 @pytest.mark.asyncio
 async def test_node_refuses_to_run_without_a_selection():
     with pytest.raises(ValueError, match="selected_papers"):
-        await synthesis_integrity_node(cast(dict, {"domain": "d", "selected_papers": []}))
+        await synthesis_integrity_node(cast(ResearchState, {"domain": "d", "selected_papers": []}))
 
 
 # ------------------------------------------------------------------
