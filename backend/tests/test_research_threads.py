@@ -1,11 +1,14 @@
 """Tests for the application-owned research thread metadata store."""
 
+import os
 from datetime import datetime, timezone
 from uuid import UUID
 
 import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from backend.config import get_settings
+from backend import research_threads
 from backend.research_threads import (
     INITIAL_THREAD_STATUS,
     VALID_THREAD_STATUSES,
@@ -16,13 +19,36 @@ from backend.research_threads import (
 )
 
 
-@pytest.fixture
-def metadata_database(monkeypatch: pytest.MonkeyPatch, tmp_path):
-    """Point each test to an isolated metadata SQLite database."""
-    monkeypatch.setenv("THREAD_METADATA_DB_PATH", str(tmp_path / "threads.sqlite"))
-    get_settings.cache_clear()
-    yield
-    get_settings.cache_clear()
+@pytest_asyncio.fixture
+async def metadata_database(monkeypatch: pytest.MonkeyPatch):
+    """Create an isolated research_threads table in a test PostgreSQL DB."""
+    test_database_url = os.environ.get("TEST_DATABASE_URL")
+    if not test_database_url:
+        pytest.skip("TEST_DATABASE_URL is not configured; PostgreSQL integration test skipped.")
+
+    if test_database_url == os.environ.get("DATABASE_URL"):
+        pytest.fail("TEST_DATABASE_URL must not point to DATABASE_URL.")
+
+    test_engine = create_async_engine(test_database_url, pool_pre_ping=True)
+    test_session_factory = async_sessionmaker(
+        bind=test_engine,
+        expire_on_commit=False,
+    )
+    monkeypatch.setattr(
+        research_threads,
+        "async_session_factory",
+        test_session_factory,
+    )
+
+    async with test_engine.begin() as connection:
+        await connection.run_sync(research_threads.research_threads_metadata.create_all)
+
+    try:
+        yield
+    finally:
+        async with test_engine.begin() as connection:
+            await connection.run_sync(research_threads.research_threads_metadata.drop_all)
+        await test_engine.dispose()
 
 
 @pytest.mark.asyncio
