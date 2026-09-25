@@ -30,6 +30,10 @@ load_dotenv()
 os.environ.setdefault("CONTACT_EMAIL", "tests@nexora.local")
 os.environ.setdefault("OPENALEX_MAILTO", "tests@nexora.local")
 os.environ.setdefault("JWT_SECRET_KEY", "nexora-test-only-jwt-secret")
+os.environ.setdefault(
+    "DATABASE_URL",
+    "postgresql+psycopg://test:test@db.invalid:5432/nexora_test",
+)
 
 # auth/google_auth.py and auth/encryption.py both raise RuntimeError at
 # import time (by design) when their required env var is missing -- same

@@ -11,6 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from dotenv import load_dotenv
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 # Must run before any other backend module reads an env var at import time
@@ -22,12 +23,20 @@ from pydantic_settings import BaseSettings
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
+def _missing_database_url() -> str:
+    raise RuntimeError(
+        "DATABASE_URL is not set. Configure the shared PostgreSQL connection "
+        "string in the environment or backend/.env."
+    )
+
+
 class Settings(BaseSettings):
     # TODO: add fields for every var in .env.example
     gemini_api_key: str = ""
     openalex_mailto: str = ""
     semantic_scholar_api_key: str | None = None
     nvidia_api_key: str = ""
+    database_url: str = Field(default_factory=_missing_database_url)
     sqlite_db_path: str = "nexora_checkpoints.sqlite"
     thread_metadata_db_path: str = "nexora_threads.sqlite"
 
