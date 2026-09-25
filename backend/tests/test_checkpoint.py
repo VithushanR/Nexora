@@ -11,6 +11,7 @@ from backend.graph import checkpoint
 
 
 DATABASE_URL = "postgresql+psycopg://checkpoint_user:safe-password@db.example.test:5432/nexora"
+CHECKPOINT_SCHEMA = "nexora_checkpoints"
 
 
 def test_normalize_psycopg_url_removes_only_sqlalchemy_driver() -> None:
@@ -50,7 +51,10 @@ def test_resource_construction_does_not_create_or_open_a_pool(
     pool_factory = Mock()
     monkeypatch.setattr(checkpoint, "AsyncConnectionPool", pool_factory)
 
-    resource = checkpoint.PostgresCheckpointResource(DATABASE_URL)
+    resource = checkpoint.PostgresCheckpointResource(
+        DATABASE_URL,
+        checkpoint_schema=CHECKPOINT_SCHEMA,
+    )
 
     pool_factory.assert_not_called()
     with pytest.raises(RuntimeError, match="not open"):
@@ -67,6 +71,7 @@ def test_resource_can_read_database_url_from_settings(
     )
 
     resource = checkpoint.PostgresCheckpointResource.from_settings(
+        checkpoint_schema=CHECKPOINT_SCHEMA,
         min_size=2,
         max_size=3,
     )
@@ -90,6 +95,7 @@ async def test_open_constructs_configured_pool_and_saver_without_schema_setup(
     monkeypatch.setattr(checkpoint, "AsyncPostgresSaver", saver_factory)
     resource = checkpoint.PostgresCheckpointResource(
         DATABASE_URL,
+        checkpoint_schema=CHECKPOINT_SCHEMA,
         min_size=2,
         max_size=3,
     )
@@ -106,6 +112,7 @@ async def test_open_constructs_configured_pool_and_saver_without_schema_setup(
             "autocommit": True,
             "prepare_threshold": 0,
             "row_factory": dict_row,
+            "options": "-c search_path=nexora_checkpoints",
         },
     }
     pool.open.assert_awaited_once_with(wait=True)
@@ -128,7 +135,10 @@ async def test_failed_open_closes_pool_and_leaves_resource_unopened(
     pool.open = AsyncMock(side_effect=RuntimeError("connection failed"))
     pool.close = AsyncMock()
     monkeypatch.setattr(checkpoint, "AsyncConnectionPool", Mock(return_value=pool))
-    resource = checkpoint.PostgresCheckpointResource(DATABASE_URL)
+    resource = checkpoint.PostgresCheckpointResource(
+        DATABASE_URL,
+        checkpoint_schema=CHECKPOINT_SCHEMA,
+    )
 
     with pytest.raises(RuntimeError, match="connection failed"):
         await resource.open()
@@ -140,6 +150,28 @@ async def test_failed_open_closes_pool_and_leaves_resource_unopened(
 
 @pytest.mark.asyncio
 async def test_close_before_open_is_harmless() -> None:
-    resource = checkpoint.PostgresCheckpointResource(DATABASE_URL)
+    resource = checkpoint.PostgresCheckpointResource(
+        DATABASE_URL,
+        checkpoint_schema=CHECKPOINT_SCHEMA,
+    )
 
     await resource.close()
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        "",
+        "public",
+        "public, nexora_checkpoints",
+        "Public",
+        "nexora-checkpoints",
+        'bad"schema',
+    ],
+)
+def test_checkpoint_schema_must_be_one_safe_explicit_identifier(schema: str) -> None:
+    with pytest.raises(ValueError, match="dedicated lowercase PostgreSQL identifier"):
+        checkpoint.PostgresCheckpointResource(
+            DATABASE_URL,
+            checkpoint_schema=schema,
+        )
