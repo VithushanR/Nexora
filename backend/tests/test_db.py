@@ -15,6 +15,21 @@ def test_database_url_is_required(monkeypatch: pytest.MonkeyPatch, tmp_path) -> 
         Settings()
 
 
+def test_checkpoint_database_url_is_required(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+psycopg://test:test@db.invalid:5432/nexora_test",
+    )
+    monkeypatch.delenv("CHECKPOINT_DATABASE_URL", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(RuntimeError, match="CHECKPOINT_DATABASE_URL is not set"):
+        Settings()
+
+
 def test_postgresql_engine_and_session_factory_are_constructed() -> None:
     assert engine.dialect.name == "postgresql"
     assert engine.dialect.driver == "psycopg"

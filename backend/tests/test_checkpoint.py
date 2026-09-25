@@ -67,7 +67,7 @@ def test_resource_can_read_database_url_from_settings(
     monkeypatch.setattr(
         checkpoint,
         "get_settings",
-        lambda: SimpleNamespace(database_url=DATABASE_URL),
+        lambda: SimpleNamespace(checkpoint_database_url=DATABASE_URL),
     )
 
     resource = checkpoint.PostgresCheckpointResource.from_settings(

@@ -134,7 +134,7 @@ async def graph_context() -> AsyncIterator[Any]:
     This avoids importing source clients merely to import the HTTP app. Tests
     replace this seam with a deterministic context manager.
     """
-    from backend.graph.build_graph import graph_context as production_graph_context
+    from backend.graph.runtime import graph_context as production_graph_context
 
     async with production_graph_context() as app:
         yield app

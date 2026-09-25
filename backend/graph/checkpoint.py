@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import re
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from typing import Any
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.graph import StateGraph
 from psycopg import AsyncConnection
 from psycopg.rows import DictRow, dict_row
 from psycopg_pool import AsyncConnectionPool
@@ -15,6 +20,7 @@ from backend.config import get_settings
 
 DEFAULT_CHECKPOINT_POOL_MIN_SIZE = 1
 DEFAULT_CHECKPOINT_POOL_MAX_SIZE = 4
+PRODUCTION_CHECKPOINT_SCHEMA = "nexora_checkpoints"
 _SCHEMA_NAME = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
@@ -74,7 +80,7 @@ class PostgresCheckpointResource:
     ) -> PostgresCheckpointResource:
         """Create an unopened resource from the application's current settings."""
         return cls(
-            get_settings().database_url,
+            get_settings().checkpoint_database_url,
             checkpoint_schema=checkpoint_schema,
             min_size=min_size,
             max_size=max_size,
@@ -123,3 +129,13 @@ class PostgresCheckpointResource:
         self._pool = None
         if pool is not None:
             await pool.close()
+
+
+@asynccontextmanager
+async def sqlite_checkpoint_context(
+    sqlite_db_path: str,
+    graph_builder: Callable[[], StateGraph],
+) -> AsyncIterator[Any]:
+    """Retain isolated SQLite checkpoint support for legacy-focused tests."""
+    async with AsyncSqliteSaver.from_conn_string(sqlite_db_path) as checkpointer:
+        yield graph_builder().compile(checkpointer=checkpointer)

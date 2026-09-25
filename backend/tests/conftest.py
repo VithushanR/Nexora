@@ -37,6 +37,10 @@ os.environ.setdefault(
     "DATABASE_URL",
     "postgresql+psycopg://test:test@db.invalid:5432/nexora_test",
 )
+os.environ.setdefault(
+    "CHECKPOINT_DATABASE_URL",
+    "postgresql+psycopg://test:test@db.invalid:5432/nexora_checkpoint_test",
+)
 
 # auth/google_auth.py and auth/encryption.py both raise RuntimeError at
 # import time (by design) when their required env var is missing -- same

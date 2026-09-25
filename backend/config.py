@@ -30,6 +30,13 @@ def _missing_database_url() -> str:
     )
 
 
+def _missing_checkpoint_database_url() -> str:
+    raise RuntimeError(
+        "CHECKPOINT_DATABASE_URL is not set. Configure the PostgreSQL "
+        "checkpoint connection string in the environment or backend/.env."
+    )
+
+
 class Settings(BaseSettings):
     # TODO: add fields for every var in .env.example
     gemini_api_key: str = ""
@@ -37,6 +44,9 @@ class Settings(BaseSettings):
     semantic_scholar_api_key: str | None = None
     nvidia_api_key: str = ""
     database_url: str = Field(default_factory=_missing_database_url)
+    checkpoint_database_url: str = Field(
+        default_factory=_missing_checkpoint_database_url
+    )
     sqlite_db_path: str = "nexora_checkpoints.sqlite"
     thread_metadata_db_path: str = "nexora_threads.sqlite"
 
