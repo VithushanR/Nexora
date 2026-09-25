@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from langgraph.types import Command
 
 from backend.auth.jwt import get_current_user
+from backend.auth.users import get_user_tier
 # Kept importable as research.ResearchStartRateLimiter for backward
 # compatibility with existing tests -- see backend/rate_limit.py.
 from backend.rate_limit import RollingWindowRateLimiter as ResearchStartRateLimiter
@@ -29,6 +30,7 @@ from backend.safety.policy import (
     SafetyPolicyInputError,
     apply_safety_policy,
 )
+from backend.tiers import TierName
 
 logger = logging.getLogger("nexora.research_router")
 
@@ -208,12 +210,24 @@ async def _resume_research(thread_id: str, selected_indices: list[int]) -> None:
         await _mark_error(thread_id)
 
 
-async def _start_initial_research(thread_id: str, domain: str) -> None:
+async def _start_initial_research(
+    thread_id: str,
+    user_id: str,
+    tier: TierName,
+    domain: str,
+) -> None:
     """BackgroundTask body for the Agent 1/2 phase through selection pause."""
     config = THREAD_CONFIG(thread_id)
     try:
         async with graph_context() as app:
-            await app.ainvoke({"domain": domain}, config=config)
+            await app.ainvoke(
+                {
+                    "user_id": user_id,
+                    "tier": tier,
+                    "domain": domain,
+                },
+                config=config,
+            )
             snapshot = await app.aget_state(config)
         if not _has_selection_interrupt(snapshot):
             raise RuntimeError("Graph did not reach the paper-selection checkpoint.")
@@ -267,8 +281,15 @@ async def start_research(
             "The safety check is temporarily unavailable. Please try again later.",
         )
 
+    tier = await get_user_tier(user_id)
     thread_id = await create_thread(user_id, request.domain)
-    background_tasks.add_task(_start_initial_research, thread_id, request.domain)
+    background_tasks.add_task(
+        _start_initial_research,
+        thread_id,
+        user_id,
+        tier,
+        request.domain,
+    )
     return ResearchStartResponse(thread_id=thread_id)
 
 

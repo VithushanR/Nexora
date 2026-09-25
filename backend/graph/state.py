@@ -13,6 +13,8 @@ only the fields it owns:
 
 from typing import TypedDict, Optional, Literal
 
+from backend.tiers import TierName
+
 
 class ScreeningVerdict(TypedDict):
     verdict: Literal["INCLUDE", "EXCLUDE", "UNCERTAIN"]
@@ -46,6 +48,8 @@ class Protocol(TypedDict):
 
 
 class ResearchState(TypedDict, total=False):
+    user_id: str
+    tier: TierName
     domain: str
     protocol: Optional[Protocol]
     candidates: Optional[list[Candidate]]

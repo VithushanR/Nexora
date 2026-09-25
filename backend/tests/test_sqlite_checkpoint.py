@@ -7,6 +7,7 @@ from langgraph.types import Command
 from backend.agents.human_selection import HumanSelectionValidationError, human_selection_node
 from backend.graph.build_graph import graph_context
 from backend.graph.state import ResearchState
+from backend.tiers import TierName
 
 
 CANDIDATES = [
@@ -30,7 +31,14 @@ async def test_sqlite_checkpoint_survives_connection_reopen(tmp_path):
     config = {"configurable": {"thread_id": "persistent-selection-test"}}
 
     async with graph_context(str(db_path), build_selection_graph) as first_app:
-        paused = await first_app.ainvoke({"candidates": CANDIDATES}, config=config)
+        paused = await first_app.ainvoke(
+            {
+                "user_id": "checkpoint-owner",
+                "tier": TierName.PRO,
+                "candidates": CANDIDATES,
+            },
+            config=config,
+        )
 
         interrupt_payload = paused["__interrupt__"][0].value
         assert interrupt_payload == {
@@ -46,6 +54,8 @@ async def test_sqlite_checkpoint_survives_connection_reopen(tmp_path):
         )
 
     assert resumed["selected_papers"] == [CANDIDATES[0], CANDIDATES[2]]
+    assert resumed["user_id"] == "checkpoint-owner"
+    assert resumed["tier"] is TierName.PRO
 
 
 @pytest.mark.asyncio

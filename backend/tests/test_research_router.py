@@ -22,6 +22,7 @@ from backend.safety.nvidia_client import (
     NvidiaSafetyResponseError,
 )
 from backend.safety.policy import SafetyDecision, SafetyPolicyResult
+from backend.tiers import TierName
 
 
 @dataclass
@@ -121,6 +122,7 @@ def router_environment(monkeypatch):
     safety_policy = Mock(
         return_value=SafetyPolicyResult(decision=SafetyDecision.SAFE)
     )
+    tier_lookup = AsyncMock(return_value=TierName.FREE)
 
     async def fake_create_thread(user_id, domain):
         nonlocal next_thread
@@ -156,6 +158,7 @@ def router_environment(monkeypatch):
     monkeypatch.setattr(research, "graph_context", fake_graph_context)
     monkeypatch.setattr(research, "classify_research_topic", safety_client)
     monkeypatch.setattr(research, "apply_safety_policy", safety_policy)
+    monkeypatch.setattr(research, "get_user_tier", tier_lookup)
     monkeypatch.setattr(research, "_start_rate_limiter", research.ResearchStartRateLimiter())
 
     app = FastAPI()
@@ -169,6 +172,7 @@ def router_environment(monkeypatch):
         create_calls=create_calls,
         safety_client=safety_client,
         safety_policy=safety_policy,
+        tier_lookup=tier_lookup,
         safe_classification=safe_classification,
     )
 
@@ -195,6 +199,14 @@ def test_start_research_reaches_selection_and_returns_created_thread(router_envi
     router_environment.safety_policy.assert_called_once_with(
         "Climate adaptation", router_environment.safe_classification
     )
+    router_environment.tier_lookup.assert_awaited_once_with("owner-1")
+    assert router_environment.graph.start_inputs == [
+        {
+            "user_id": "owner-1",
+            "tier": TierName.FREE,
+            "domain": "Climate adaptation",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -264,6 +276,7 @@ def test_safety_rejection_stops_before_thread_and_graph(
     assert router_environment.create_calls == []
     assert router_environment.threads == {}
     assert router_environment.graph.start_inputs == []
+    router_environment.tier_lookup.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -292,6 +305,7 @@ def test_safety_service_failure_is_sanitized_and_fail_closed(
     assert "test-api-key" not in response.text
     assert router_environment.create_calls == []
     assert router_environment.graph.start_inputs == []
+    router_environment.tier_lookup.assert_not_awaited()
     router_environment.safety_policy.assert_not_called()
 
 
@@ -305,6 +319,7 @@ def test_unexpected_policy_result_fails_closed(router_environment):
     assert response.json()["detail"]["code"] == "SAFETY_UNAVAILABLE"
     assert router_environment.create_calls == []
     assert router_environment.graph.start_inputs == []
+    router_environment.tier_lookup.assert_not_awaited()
 
 
 @pytest.mark.parametrize("domain", ["", "   ", "x" * 501])
@@ -328,6 +343,7 @@ def test_authentication_occurs_before_safety_service(router_environment):
     router_environment.safety_client.assert_not_awaited()
     assert router_environment.create_calls == []
     assert router_environment.graph.start_inputs == []
+    router_environment.tier_lookup.assert_not_awaited()
 
 
 def test_rate_limit_occurs_before_safety_service(router_environment, monkeypatch):
@@ -343,6 +359,7 @@ def test_rate_limit_occurs_before_safety_service(router_environment, monkeypatch
     router_environment.safety_client.assert_not_awaited()
     assert router_environment.create_calls == []
     assert router_environment.graph.start_inputs == []
+    router_environment.tier_lookup.assert_not_awaited()
 
 
 def test_start_research_security_boundary_call_order(router_environment, monkeypatch):
@@ -365,6 +382,10 @@ def test_start_research_security_boundary_call_order(router_environment, monkeyp
         calls.append("safety_policy")
         return SafetyPolicyResult(decision=SafetyDecision.SAFE)
 
+    async def resolve_tier(user_id):
+        calls.append("get_user_tier")
+        return TierName.FREE
+
     original_create_thread = research.create_thread
     original_ainvoke = router_environment.graph.ainvoke
 
@@ -380,6 +401,7 @@ def test_start_research_security_boundary_call_order(router_environment, monkeyp
     monkeypatch.setattr(research, "_start_rate_limiter", OrderedLimiter())
     monkeypatch.setattr(research, "classify_research_topic", classify)
     monkeypatch.setattr(research, "apply_safety_policy", apply_policy)
+    monkeypatch.setattr(research, "get_user_tier", resolve_tier)
     monkeypatch.setattr(research, "create_thread", create)
     monkeypatch.setattr(router_environment.graph, "ainvoke", invoke)
 
@@ -392,6 +414,7 @@ def test_start_research_security_boundary_call_order(router_environment, monkeyp
         "rate_limit",
         "safety_client",
         "safety_policy",
+        "get_user_tier",
         "create_thread",
         "graph",
     ]
@@ -445,6 +468,14 @@ def test_real_jwt_supplies_string_user_id_to_research_router(router_environment)
     assert response.status_code == 201
     thread_id = response.json()["thread_id"]
     assert router_environment.threads[thread_id].user_id == "jwt-owner"
+    router_environment.tier_lookup.assert_awaited_once_with("jwt-owner")
+    assert router_environment.graph.start_inputs == [
+        {
+            "user_id": "jwt-owner",
+            "tier": TierName.FREE,
+            "domain": "Climate adaptation",
+        }
+    ]
 
 
 def test_status_returns_safe_metadata_detail(router_environment):
