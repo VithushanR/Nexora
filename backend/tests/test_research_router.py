@@ -10,10 +10,11 @@ from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from backend.auth.jwt import create_access_token, get_current_user
+from backend.research_threads import MonthlyResearchQuotaExceeded
 from backend.routers import research
 from backend.safety.nvidia_client import (
     NvidiaSafetyClassification,
@@ -22,6 +23,7 @@ from backend.safety.nvidia_client import (
     NvidiaSafetyResponseError,
 )
 from backend.safety.policy import SafetyDecision, SafetyPolicyResult
+from backend.tiers import TierName, get_tier_config
 
 
 @dataclass
@@ -110,7 +112,8 @@ def router_environment(monkeypatch):
     updates: list[tuple[str, str]] = []
     graph = FakeGraph()
     next_thread = 0
-    create_calls: list[tuple[str, str]] = []
+    create_calls: list[tuple[str, str, int | None]] = []
+    quota_failure: dict[str, Exception | None] = {"exception": None}
     safe_classification = NvidiaSafetyClassification(
         user_safety="safe",
         raw_user_safety="safe",
@@ -121,10 +124,13 @@ def router_environment(monkeypatch):
     safety_policy = Mock(
         return_value=SafetyPolicyResult(decision=SafetyDecision.SAFE)
     )
+    tier_lookup = AsyncMock(return_value=TierName.FREE)
 
-    async def fake_create_thread(user_id, domain):
+    async def fake_create_thread(user_id, domain, monthly_limit):
         nonlocal next_thread
-        create_calls.append((str(user_id), domain))
+        if quota_failure["exception"] is not None:
+            raise quota_failure["exception"]
+        create_calls.append((str(user_id), domain, monthly_limit))
         next_thread += 1
         thread_id = f"thread-{next_thread}"
         threads[thread_id] = FakeThread(thread_id, str(user_id), domain, "running_agent2")
@@ -149,13 +155,15 @@ def router_environment(monkeypatch):
     async def fake_graph_context():
         yield graph
 
-    monkeypatch.setattr(research, "create_thread", fake_create_thread)
+    quota_creator = AsyncMock(side_effect=fake_create_thread)
+    monkeypatch.setattr(research, "create_thread_with_monthly_quota", quota_creator)
     monkeypatch.setattr(research, "get_thread", fake_get_thread)
     monkeypatch.setattr(research, "update_thread_status", fake_update_status)
     monkeypatch.setattr(research, "verify_thread_owner", fake_verify_owner)
     monkeypatch.setattr(research, "graph_context", fake_graph_context)
     monkeypatch.setattr(research, "classify_research_topic", safety_client)
     monkeypatch.setattr(research, "apply_safety_policy", safety_policy)
+    monkeypatch.setattr(research, "get_user_tier", tier_lookup)
     monkeypatch.setattr(research, "_start_rate_limiter", research.ResearchStartRateLimiter())
 
     app = FastAPI()
@@ -167,8 +175,11 @@ def router_environment(monkeypatch):
         updates=updates,
         graph=graph,
         create_calls=create_calls,
+        quota_creator=quota_creator,
+        quota_failure=quota_failure,
         safety_client=safety_client,
         safety_policy=safety_policy,
+        tier_lookup=tier_lookup,
         safe_classification=safe_classification,
     )
 
@@ -195,6 +206,61 @@ def test_start_research_reaches_selection_and_returns_created_thread(router_envi
     router_environment.safety_policy.assert_called_once_with(
         "Climate adaptation", router_environment.safe_classification
     )
+    router_environment.tier_lookup.assert_awaited_once_with("owner-1")
+    assert router_environment.create_calls == [
+        (
+            "owner-1",
+            "Climate adaptation",
+            get_tier_config(TierName.FREE).monthly_research_runs,
+        )
+    ]
+    assert router_environment.graph.start_inputs == [
+        {
+            "user_id": "owner-1",
+            "tier": TierName.FREE,
+            "domain": "Climate adaptation",
+        }
+    ]
+
+
+@pytest.mark.parametrize("tier", [TierName.FREE, TierName.PRO, TierName.TEAM])
+def test_start_passes_centralized_monthly_limit_for_tier(router_environment, tier):
+    router_environment.tier_lookup.return_value = tier
+
+    with _client(router_environment) as client:
+        response = client.post("/research", json={"domain": "Tier quota test"})
+
+    assert response.status_code == 201
+    router_environment.quota_creator.assert_awaited_once_with(
+        "owner-1",
+        "Tier quota test",
+        get_tier_config(tier).monthly_research_runs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_monthly_quota_rejection_returns_429_without_thread_or_background_task(
+    router_environment,
+):
+    router_environment.quota_failure["exception"] = MonthlyResearchQuotaExceeded()
+    background_tasks = BackgroundTasks()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await research.start_research(
+            research.ResearchStartRequest(domain="Quota exhausted"),
+            background_tasks,
+            "owner-1",
+        )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail == {
+        "code": "RESEARCH_MONTHLY_QUOTA_EXCEEDED",
+        "message": "Your monthly research-run limit has been reached.",
+    }
+    assert router_environment.threads == {}
+    assert router_environment.create_calls == []
+    assert background_tasks.tasks == []
+    assert router_environment.graph.start_inputs == []
 
 
 @pytest.mark.asyncio
@@ -264,6 +330,8 @@ def test_safety_rejection_stops_before_thread_and_graph(
     assert router_environment.create_calls == []
     assert router_environment.threads == {}
     assert router_environment.graph.start_inputs == []
+    router_environment.tier_lookup.assert_not_awaited()
+    router_environment.quota_creator.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -292,6 +360,8 @@ def test_safety_service_failure_is_sanitized_and_fail_closed(
     assert "test-api-key" not in response.text
     assert router_environment.create_calls == []
     assert router_environment.graph.start_inputs == []
+    router_environment.tier_lookup.assert_not_awaited()
+    router_environment.quota_creator.assert_not_awaited()
     router_environment.safety_policy.assert_not_called()
 
 
@@ -305,6 +375,8 @@ def test_unexpected_policy_result_fails_closed(router_environment):
     assert response.json()["detail"]["code"] == "SAFETY_UNAVAILABLE"
     assert router_environment.create_calls == []
     assert router_environment.graph.start_inputs == []
+    router_environment.tier_lookup.assert_not_awaited()
+    router_environment.quota_creator.assert_not_awaited()
 
 
 @pytest.mark.parametrize("domain", ["", "   ", "x" * 501])
@@ -328,6 +400,8 @@ def test_authentication_occurs_before_safety_service(router_environment):
     router_environment.safety_client.assert_not_awaited()
     assert router_environment.create_calls == []
     assert router_environment.graph.start_inputs == []
+    router_environment.tier_lookup.assert_not_awaited()
+    router_environment.quota_creator.assert_not_awaited()
 
 
 def test_rate_limit_occurs_before_safety_service(router_environment, monkeypatch):
@@ -343,6 +417,8 @@ def test_rate_limit_occurs_before_safety_service(router_environment, monkeypatch
     router_environment.safety_client.assert_not_awaited()
     assert router_environment.create_calls == []
     assert router_environment.graph.start_inputs == []
+    router_environment.tier_lookup.assert_not_awaited()
+    router_environment.quota_creator.assert_not_awaited()
 
 
 def test_start_research_security_boundary_call_order(router_environment, monkeypatch):
@@ -365,12 +441,16 @@ def test_start_research_security_boundary_call_order(router_environment, monkeyp
         calls.append("safety_policy")
         return SafetyPolicyResult(decision=SafetyDecision.SAFE)
 
-    original_create_thread = research.create_thread
+    async def resolve_tier(user_id):
+        calls.append("get_user_tier")
+        return TierName.FREE
+
+    original_create_thread = research.create_thread_with_monthly_quota
     original_ainvoke = router_environment.graph.ainvoke
 
-    async def create(user_id, domain):
+    async def create(user_id, domain, monthly_limit):
         calls.append("create_thread")
-        return await original_create_thread(user_id, domain)
+        return await original_create_thread(user_id, domain, monthly_limit)
 
     async def invoke(input_value, config=None):
         calls.append("graph")
@@ -380,7 +460,8 @@ def test_start_research_security_boundary_call_order(router_environment, monkeyp
     monkeypatch.setattr(research, "_start_rate_limiter", OrderedLimiter())
     monkeypatch.setattr(research, "classify_research_topic", classify)
     monkeypatch.setattr(research, "apply_safety_policy", apply_policy)
-    monkeypatch.setattr(research, "create_thread", create)
+    monkeypatch.setattr(research, "get_user_tier", resolve_tier)
+    monkeypatch.setattr(research, "create_thread_with_monthly_quota", create)
     monkeypatch.setattr(router_environment.graph, "ainvoke", invoke)
 
     with _client(router_environment) as client:
@@ -392,6 +473,7 @@ def test_start_research_security_boundary_call_order(router_environment, monkeyp
         "rate_limit",
         "safety_client",
         "safety_policy",
+        "get_user_tier",
         "create_thread",
         "graph",
     ]
@@ -445,6 +527,14 @@ def test_real_jwt_supplies_string_user_id_to_research_router(router_environment)
     assert response.status_code == 201
     thread_id = response.json()["thread_id"]
     assert router_environment.threads[thread_id].user_id == "jwt-owner"
+    router_environment.tier_lookup.assert_awaited_once_with("jwt-owner")
+    assert router_environment.graph.start_inputs == [
+        {
+            "user_id": "jwt-owner",
+            "tier": TierName.FREE,
+            "domain": "Climate adaptation",
+        }
+    ]
 
 
 def test_status_returns_safe_metadata_detail(router_environment):
@@ -458,6 +548,7 @@ def test_status_returns_safe_metadata_detail(router_environment):
         "status": "paused_for_selection",
         "detail": "Research is waiting for paper selection.",
     }
+    router_environment.quota_creator.assert_not_awaited()
 
 
 def test_missing_and_unowned_threads_both_return_not_found(router_environment):
@@ -487,6 +578,7 @@ def test_candidates_return_only_the_public_candidate_projection(router_environme
         "title", "doi", "abstract", "year", "source", "verdict", "quote",
         "reason", "paper_url", "prerank_score", "relevance_percent", "has_usable_abstract",
     }
+    router_environment.quota_creator.assert_not_awaited()
 
 
 def test_candidates_require_paused_metadata_status(router_environment):
@@ -523,6 +615,7 @@ def test_select_resumes_checkpoint_in_background_and_marks_done(router_environme
     assert router_environment.graph.resume_payloads == [{"selected_indices": [0, 1]}]
     assert (thread.thread_id, "running_synthesis") in router_environment.updates
     assert router_environment.threads[thread.thread_id].status == "done"
+    router_environment.quota_creator.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -578,6 +671,7 @@ def test_report_returns_runtime_markdown_when_done(router_environment):
 
     assert response.status_code == 200
     assert response.json() == {"report": "# Completed report"}
+    router_environment.quota_creator.assert_not_awaited()
 
 
 def test_done_thread_without_report_returns_safe_server_error(router_environment):
@@ -616,6 +710,7 @@ def test_report_pdf_returns_downloadable_pdf_when_done(router_environment):
     assert "attachment" in response.headers["content-disposition"]
     assert thread.thread_id in response.headers["content-disposition"]
     assert response.content.startswith(b"%PDF")
+    router_environment.quota_creator.assert_not_awaited()
 
 
 def test_start_rate_limit_rejects_the_eleventh_request(router_environment):

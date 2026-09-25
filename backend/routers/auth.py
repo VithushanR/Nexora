@@ -79,7 +79,11 @@ async def login_with_google(body: GoogleLoginRequest):
             detail="Google account did not provide an email address.",
         )
 
-    user_id = find_or_create_user(google_sub=google_sub, email=email, name=name)
+    user_id = await find_or_create_user(
+        google_sub=google_sub,
+        email=email,
+        name=name,
+    )
 
     access_token = create_access_token(user_id)
 

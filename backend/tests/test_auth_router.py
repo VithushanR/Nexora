@@ -3,10 +3,11 @@ backend/tests/test_auth_router.py
 
 Part D — tests for routers/auth.py (POST /auth/google)
 
-Mocks only the Google verification boundary (verify_google_id_token),
-then tests the REAL find_or_create_user() and REAL create_access_token()
-end to end, so this actually proves the whole login flow produces a
-usable, decodable JWT for a real internal user_id.
+Mocks the Google verification boundary (verify_google_id_token) and stubs
+the asynchronous user-persistence boundary (find_or_create_user), while
+testing the route behavior and real JWT creation/decoding. This proves the
+login route produces a usable, decodable JWT for the resolved internal
+user_id without exercising PostgreSQL persistence.
 """
 
 import pytest
@@ -14,17 +15,24 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import routers.auth as auth_router_module
-import backend.auth.users as users_module
 from routers.auth import router
 from backend.auth.jwt import decode_access_token
 
 
 @pytest.fixture(autouse=True)
-def clean_db(monkeypatch, tmp_path):
-    db_path = tmp_path / "test_users.db"
-    monkeypatch.setattr(users_module, "_DB_PATH", str(db_path))
-    users_module._init_db()
-    yield
+def fake_user_store(monkeypatch):
+    """Keep route tests focused on awaiting the persistence boundary."""
+    user_ids = {}
+
+    async def fake_find_or_create_user(google_sub, email, name=None):
+        user_ids.setdefault(google_sub, f"user-{len(user_ids) + 1}")
+        return user_ids[google_sub]
+
+    monkeypatch.setattr(
+        auth_router_module,
+        "find_or_create_user",
+        fake_find_or_create_user,
+    )
 
 
 def _make_test_app() -> FastAPI:

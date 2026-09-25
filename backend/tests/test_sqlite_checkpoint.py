@@ -5,8 +5,9 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
 from backend.agents.human_selection import HumanSelectionValidationError, human_selection_node
-from backend.graph.build_graph import graph_context
+from backend.graph.checkpoint import sqlite_checkpoint_context
 from backend.graph.state import ResearchState
+from backend.tiers import TierName
 
 
 CANDIDATES = [
@@ -29,8 +30,15 @@ async def test_sqlite_checkpoint_survives_connection_reopen(tmp_path):
     db_path = tmp_path / "selection-checkpoints.sqlite"
     config = {"configurable": {"thread_id": "persistent-selection-test"}}
 
-    async with graph_context(str(db_path), build_selection_graph) as first_app:
-        paused = await first_app.ainvoke({"candidates": CANDIDATES}, config=config)
+    async with sqlite_checkpoint_context(str(db_path), build_selection_graph) as first_app:
+        paused = await first_app.ainvoke(
+            {
+                "user_id": "checkpoint-owner",
+                "tier": TierName.PRO,
+                "candidates": CANDIDATES,
+            },
+            config=config,
+        )
 
         interrupt_payload = paused["__interrupt__"][0].value
         assert interrupt_payload == {
@@ -39,13 +47,15 @@ async def test_sqlite_checkpoint_survives_connection_reopen(tmp_path):
             "candidate_count": len(CANDIDATES),
         }
 
-    async with graph_context(str(db_path), build_selection_graph) as second_app:
+    async with sqlite_checkpoint_context(str(db_path), build_selection_graph) as second_app:
         resumed = await second_app.ainvoke(
             Command(resume={"selected_indices": [0, 2]}),
             config=config,
         )
 
     assert resumed["selected_papers"] == [CANDIDATES[0], CANDIDATES[2]]
+    assert resumed["user_id"] == "checkpoint-owner"
+    assert resumed["tier"] is TierName.PRO
 
 
 @pytest.mark.asyncio
@@ -53,10 +63,10 @@ async def test_sqlite_checkpoint_rejects_invalid_selection_after_reopen(tmp_path
     db_path = tmp_path / "invalid-selection.sqlite"
     config = {"configurable": {"thread_id": "invalid-selection-test"}}
 
-    async with graph_context(str(db_path), build_selection_graph) as first_app:
+    async with sqlite_checkpoint_context(str(db_path), build_selection_graph) as first_app:
         await first_app.ainvoke({"candidates": CANDIDATES}, config=config)
 
-    async with graph_context(str(db_path), build_selection_graph) as second_app:
+    async with sqlite_checkpoint_context(str(db_path), build_selection_graph) as second_app:
         with pytest.raises(HumanSelectionValidationError, match="outside"):
             await second_app.ainvoke(
                 Command(resume={"selected_indices": [3]}),

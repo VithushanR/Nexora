@@ -18,14 +18,8 @@ All four agents and report assembly are wired. Agent 3 and Agent 4 fan out
 from the human checkpoint and synchronise at report assembly.
 """
 
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
-from typing import Any
-
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from backend.config import get_settings
 from backend.graph.state import ResearchState
 from backend.agents.protocol_planning import protocol_planning_node
 from backend.agents.retrieval_screening import retrieval_screening_node
@@ -58,14 +52,3 @@ def build_graph() -> StateGraph:
     graph.add_edge("report_assembly", END)
 
     return graph
-
-
-@asynccontextmanager
-async def graph_context(
-    sqlite_db_path: str | None = None,
-    graph_builder: Callable[[], StateGraph] = build_graph,
-) -> AsyncIterator[Any]:
-    """Yield a compiled graph while its async SQLite checkpointer is open."""
-    db_path = sqlite_db_path or get_settings().sqlite_db_path
-    async with AsyncSqliteSaver.from_conn_string(db_path) as checkpointer:
-        yield graph_builder().compile(checkpointer=checkpointer)

@@ -20,8 +20,11 @@ runnable in CI, where there is no .env and no outbound request is made
 anyway because every source call in these tests is mocked.
 """
 
+import asyncio
 import os
+import sys
 
+import pytest
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
@@ -30,6 +33,14 @@ load_dotenv()
 os.environ.setdefault("CONTACT_EMAIL", "tests@nexora.local")
 os.environ.setdefault("OPENALEX_MAILTO", "tests@nexora.local")
 os.environ.setdefault("JWT_SECRET_KEY", "nexora-test-only-jwt-secret")
+os.environ.setdefault(
+    "DATABASE_URL",
+    "postgresql+psycopg://test:test@db.invalid:5432/nexora_test",
+)
+os.environ.setdefault(
+    "CHECKPOINT_DATABASE_URL",
+    "postgresql+psycopg://test:test@db.invalid:5432/nexora_checkpoint_test",
+)
 
 # auth/google_auth.py and auth/encryption.py both raise RuntimeError at
 # import time (by design) when their required env var is missing -- same
@@ -39,3 +50,14 @@ os.environ.setdefault("JWT_SECRET_KEY", "nexora-test-only-jwt-secret")
 # call or relies on ENCRYPTION_KEY decrypting anything encrypted elsewhere.
 os.environ.setdefault("GOOGLE_OAUTH_CLIENT_ID", "nexora-test-only.apps.googleusercontent.com")
 os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
+
+
+def pytest_asyncio_loop_factories(
+    config: pytest.Config,
+    item: pytest.Item,
+):
+    """Use psycopg-compatible selector loops for PostgreSQL integration tests."""
+    if sys.platform == "win32" and item.path.name == "test_research_threads.py":
+        return {"windows_selector": asyncio.SelectorEventLoop}
+
+    return {"default": asyncio.new_event_loop}

@@ -2,7 +2,10 @@ fastapi
 uvicorn[standard]
 langgraph
 langgraph-checkpoint-sqlite
+langgraph-checkpoint-postgres
 aiosqlite
+SQLAlchemy[asyncio]
+psycopg[binary]
 langchain-google-genai
 google-genai
 httpx

@@ -1,21 +1,33 @@
-"""SQLite-backed metadata for research graph threads.
+"""PostgreSQL-backed metadata for research graph threads.
 
-This module deliberately stores API-facing metadata separately from the
-LangGraph checkpoint database.  Future routers use these functions without
-needing to know how SQLite connections or schema setup are handled.
+API-facing metadata remains separate from LangGraph checkpoint persistence.
+Callers use this module without needing to manage SQLAlchemy sessions.
 """
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import AsyncIterator
+from typing import Any, cast
 from uuid import uuid4
 
-import aiosqlite
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    DateTime,
+    Index,
+    MetaData,
+    Table,
+    Text,
+    func,
+    insert,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.engine import CursorResult, RowMapping
 
-from backend.config import get_settings
+from backend.db import async_session_factory
 
 
 VALID_THREAD_STATUSES = frozenset(
@@ -29,27 +41,30 @@ VALID_THREAD_STATUSES = frozenset(
 )
 INITIAL_THREAD_STATUS = "running_agent2"
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS research_threads (
-    thread_id TEXT PRIMARY KEY NOT NULL,
-    user_id TEXT NOT NULL,
-    domain TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (
-        status IN (
-            'running_agent2',
-            'paused_for_selection',
-            'running_synthesis',
-            'done',
-            'error'
-        )
+
+class MonthlyResearchQuotaExceeded(Exception):
+    """Raised when a user has consumed all research runs for the UTC month."""
+
+research_threads_metadata = MetaData()
+research_threads_table = Table(
+    "research_threads",
+    research_threads_metadata,
+    Column("thread_id", Text, primary_key=True, nullable=False),
+    Column("user_id", Text, nullable=False),
+    Column("domain", Text, nullable=False),
+    Column("status", Text, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "status IN ('running_agent2', 'paused_for_selection', "
+        "'running_synthesis', 'done', 'error')",
+        name="ck_research_threads_status",
     ),
-    created_at TEXT NOT NULL
 )
-"""
-_USER_CREATED_INDEX = """
-CREATE INDEX IF NOT EXISTS idx_research_threads_user_created
-ON research_threads (user_id, created_at DESC)
-"""
+Index(
+    "idx_research_threads_user_created",
+    research_threads_table.c.user_id.asc(),
+    research_threads_table.c.created_at.desc(),
+)
 
 
 @dataclass(frozen=True)
@@ -63,67 +78,127 @@ class ResearchThread:
     created_at: str
 
 
-@asynccontextmanager
-async def _metadata_connection() -> AsyncIterator[aiosqlite.Connection]:
-    """Open one short-lived, initialized metadata database connection."""
-    database_path = get_settings().thread_metadata_db_path
-    async with aiosqlite.connect(database_path) as connection:
-        await connection.execute("PRAGMA busy_timeout = 5000")
-        await connection.execute("PRAGMA foreign_keys = ON")
-        await connection.execute("PRAGMA journal_mode = WAL")
-        await connection.execute(_SCHEMA)
-        await connection.execute(_USER_CREATED_INDEX)
-        await connection.commit()
-        yield connection
-
-
 def _validate_status(status: str) -> None:
     if status not in VALID_THREAD_STATUSES:
         valid_statuses = ", ".join(sorted(VALID_THREAD_STATUSES))
         raise ValueError(f"Invalid research thread status: {status!r}. Valid statuses: {valid_statuses}")
 
 
-def _row_to_research_thread(row: aiosqlite.Row) -> ResearchThread:
+def _row_to_research_thread(row: RowMapping) -> ResearchThread:
+    created_at = row["created_at"]
+    if not isinstance(created_at, datetime):
+        raise TypeError("research_threads.created_at must be a datetime")
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    else:
+        created_at = created_at.astimezone(timezone.utc)
+
     return ResearchThread(
         thread_id=row["thread_id"],
         user_id=row["user_id"],
         domain=row["domain"],
         status=row["status"],
-        created_at=row["created_at"],
+        created_at=created_at.isoformat(),
     )
 
 
 async def create_thread(user_id: object, domain: str) -> str:
     """Create a thread with an initial ``running_agent2`` API status."""
     thread_id = str(uuid4())
-    created_at = datetime.now(timezone.utc).isoformat()
+    created_at = datetime.now(timezone.utc)
 
-    async with _metadata_connection() as connection:
-        await connection.execute(
-            """
-            INSERT INTO research_threads (thread_id, user_id, domain, status, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (thread_id, str(user_id), domain, INITIAL_THREAD_STATUS, created_at),
-        )
-        await connection.commit()
+    async with async_session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                insert(research_threads_table).values(
+                    thread_id=thread_id,
+                    user_id=str(user_id),
+                    domain=domain,
+                    status=INITIAL_THREAD_STATUS,
+                    created_at=created_at,
+                )
+            )
+
+    return thread_id
+
+
+async def create_thread_with_monthly_quota(
+    user_id: object,
+    domain: str,
+    monthly_limit: int | None,
+) -> str:
+    """Atomically enforce a user's UTC calendar-month quota and create a thread."""
+    if monthly_limit is None:
+        return await create_thread(user_id, domain)
+
+    normalized_user_id = str(user_id)
+    thread_id = str(uuid4())
+
+    async with async_session_factory() as session:
+        async with session.begin():
+            # Serialize count-and-insert operations for this user only. The
+            # transaction-scoped lock is automatically released at commit or
+            # rollback and cannot leak through the connection pool.
+            await session.execute(
+                text(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended(:user_id, 0)"
+                    ")"
+                ),
+                {"user_id": normalized_user_id},
+            )
+
+            now = datetime.now(timezone.utc)
+            month_start = now.replace(
+                day=1,
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            if month_start.month == 12:
+                next_month_start = month_start.replace(
+                    year=month_start.year + 1,
+                    month=1,
+                )
+            else:
+                next_month_start = month_start.replace(month=month_start.month + 1)
+
+            current_month_count = await session.scalar(
+                select(func.count())
+                .select_from(research_threads_table)
+                .where(
+                    research_threads_table.c.user_id == normalized_user_id,
+                    research_threads_table.c.created_at >= month_start,
+                    research_threads_table.c.created_at < next_month_start,
+                )
+            )
+            if current_month_count is None:
+                current_month_count = 0
+            if current_month_count >= monthly_limit:
+                raise MonthlyResearchQuotaExceeded
+
+            await session.execute(
+                insert(research_threads_table).values(
+                    thread_id=thread_id,
+                    user_id=normalized_user_id,
+                    domain=domain,
+                    status=INITIAL_THREAD_STATUS,
+                    created_at=now,
+                )
+            )
 
     return thread_id
 
 
 async def get_thread(thread_id: str) -> ResearchThread | None:
     """Return metadata for a thread, or ``None`` when it does not exist."""
-    async with _metadata_connection() as connection:
-        connection.row_factory = aiosqlite.Row
-        async with connection.execute(
-            """
-            SELECT thread_id, user_id, domain, status, created_at
-            FROM research_threads
-            WHERE thread_id = ?
-            """,
-            (thread_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+    statement = select(research_threads_table).where(
+        research_threads_table.c.thread_id == thread_id
+    )
+    async with async_session_factory() as session:
+        result = await session.execute(statement)
+        row = result.mappings().one_or_none()
 
     return _row_to_research_thread(row) if row is not None else None
 
@@ -132,24 +207,27 @@ async def update_thread_status(thread_id: str, status: str) -> bool:
     """Update an existing thread status and report whether a row was changed."""
     _validate_status(status)
 
-    async with _metadata_connection() as connection:
-        cursor = await connection.execute(
-            "UPDATE research_threads SET status = ? WHERE thread_id = ?",
-            (status, thread_id),
-        )
-        await connection.commit()
-        return cursor.rowcount == 1
+    statement = (
+        update(research_threads_table)
+        .where(research_threads_table.c.thread_id == thread_id)
+        .values(status=status)
+    )
+    async with async_session_factory() as session:
+        async with session.begin():
+            result = cast(CursorResult[Any], await session.execute(statement))
+            return result.rowcount == 1
 
 
 async def verify_thread_owner(thread_id: str, user_id: object) -> bool:
     """Return whether the supplied user owns the requested thread."""
-    async with _metadata_connection() as connection:
-        async with connection.execute(
-            """
-            SELECT 1
-            FROM research_threads
-            WHERE thread_id = ? AND user_id = ?
-            """,
-            (thread_id, str(user_id)),
-        ) as cursor:
-            return await cursor.fetchone() is not None
+    statement = (
+        select(research_threads_table.c.thread_id)
+        .where(
+            research_threads_table.c.thread_id == thread_id,
+            research_threads_table.c.user_id == str(user_id),
+        )
+        .limit(1)
+    )
+    async with async_session_factory() as session:
+        result = await session.execute(statement)
+        return result.scalar_one_or_none() is not None
