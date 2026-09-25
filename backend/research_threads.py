@@ -19,8 +19,10 @@ from sqlalchemy import (
     MetaData,
     Table,
     Text,
+    func,
     insert,
     select,
+    text,
     update,
 )
 from sqlalchemy.engine import CursorResult, RowMapping
@@ -38,6 +40,10 @@ VALID_THREAD_STATUSES = frozenset(
     }
 )
 INITIAL_THREAD_STATUS = "running_agent2"
+
+
+class MonthlyResearchQuotaExceeded(Exception):
+    """Raised when a user has consumed all research runs for the UTC month."""
 
 research_threads_metadata = MetaData()
 research_threads_table = Table(
@@ -110,6 +116,75 @@ async def create_thread(user_id: object, domain: str) -> str:
                     domain=domain,
                     status=INITIAL_THREAD_STATUS,
                     created_at=created_at,
+                )
+            )
+
+    return thread_id
+
+
+async def create_thread_with_monthly_quota(
+    user_id: object,
+    domain: str,
+    monthly_limit: int | None,
+) -> str:
+    """Atomically enforce a user's UTC calendar-month quota and create a thread."""
+    if monthly_limit is None:
+        return await create_thread(user_id, domain)
+
+    normalized_user_id = str(user_id)
+    thread_id = str(uuid4())
+
+    async with async_session_factory() as session:
+        async with session.begin():
+            # Serialize count-and-insert operations for this user only. The
+            # transaction-scoped lock is automatically released at commit or
+            # rollback and cannot leak through the connection pool.
+            await session.execute(
+                text(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended(:user_id, 0)"
+                    ")"
+                ),
+                {"user_id": normalized_user_id},
+            )
+
+            now = datetime.now(timezone.utc)
+            month_start = now.replace(
+                day=1,
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            if month_start.month == 12:
+                next_month_start = month_start.replace(
+                    year=month_start.year + 1,
+                    month=1,
+                )
+            else:
+                next_month_start = month_start.replace(month=month_start.month + 1)
+
+            current_month_count = await session.scalar(
+                select(func.count())
+                .select_from(research_threads_table)
+                .where(
+                    research_threads_table.c.user_id == normalized_user_id,
+                    research_threads_table.c.created_at >= month_start,
+                    research_threads_table.c.created_at < next_month_start,
+                )
+            )
+            if current_month_count is None:
+                current_month_count = 0
+            if current_month_count >= monthly_limit:
+                raise MonthlyResearchQuotaExceeded
+
+            await session.execute(
+                insert(research_threads_table).values(
+                    thread_id=thread_id,
+                    user_id=normalized_user_id,
+                    domain=domain,
+                    status=INITIAL_THREAD_STATUS,
+                    created_at=now,
                 )
             )
 

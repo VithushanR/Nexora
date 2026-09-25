@@ -20,8 +20,11 @@ runnable in CI, where there is no .env and no outbound request is made
 anyway because every source call in these tests is mocked.
 """
 
+import asyncio
 import os
+import sys
 
+import pytest
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
@@ -43,3 +46,14 @@ os.environ.setdefault(
 # call or relies on ENCRYPTION_KEY decrypting anything encrypted elsewhere.
 os.environ.setdefault("GOOGLE_OAUTH_CLIENT_ID", "nexora-test-only.apps.googleusercontent.com")
 os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
+
+
+def pytest_asyncio_loop_factories(
+    config: pytest.Config,
+    item: pytest.Item,
+):
+    """Use psycopg-compatible selector loops for PostgreSQL integration tests."""
+    if sys.platform == "win32" and item.path.name == "test_research_threads.py":
+        return {"windows_selector": asyncio.SelectorEventLoop}
+
+    return {"default": asyncio.new_event_loop}

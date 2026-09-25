@@ -16,7 +16,8 @@ from backend.auth.users import get_user_tier
 # compatibility with existing tests -- see backend/rate_limit.py.
 from backend.rate_limit import RollingWindowRateLimiter as ResearchStartRateLimiter
 from backend.research_threads import (
-    create_thread,
+    MonthlyResearchQuotaExceeded,
+    create_thread_with_monthly_quota,
     get_thread,
     update_thread_status,
     verify_thread_owner,
@@ -30,7 +31,7 @@ from backend.safety.policy import (
     SafetyPolicyInputError,
     apply_safety_policy,
 )
-from backend.tiers import TierName
+from backend.tiers import TierName, get_tier_config
 
 logger = logging.getLogger("nexora.research_router")
 
@@ -282,7 +283,21 @@ async def start_research(
         )
 
     tier = await get_user_tier(user_id)
-    thread_id = await create_thread(user_id, request.domain)
+    monthly_limit = get_tier_config(tier).monthly_research_runs
+    try:
+        thread_id = await create_thread_with_monthly_quota(
+            user_id,
+            request.domain,
+            monthly_limit,
+        )
+    except MonthlyResearchQuotaExceeded:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "code": "RESEARCH_MONTHLY_QUOTA_EXCEEDED",
+                "message": "Your monthly research-run limit has been reached.",
+            },
+        ) from None
     background_tasks.add_task(
         _start_initial_research,
         thread_id,
