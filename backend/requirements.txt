@@ -1,5 +1,5 @@
 fastapi
-uvicorn[standard]
+uvicorn[standard]>=0.36
 langgraph
 langgraph-checkpoint-sqlite
 langgraph-checkpoint-postgres

@@ -123,9 +123,15 @@ VITE_API_BASE_URL=http://localhost:8001
 ### Running locally
 
 ```bash
-uvicorn backend.main:app --reload --port 8001   # backend
-cd frontend && npm run dev                      # frontend, separate terminal
+python -m backend.serve --reload   # backend (http://127.0.0.1:8001)
+cd frontend && npm run dev         # frontend, separate terminal
 ```
+
+Start the backend with `python -m backend.serve`, not `uvicorn backend.main:app`
+directly: on Windows, uvicorn's default event loop cannot run the async
+PostgreSQL driver (every database call fails with "Psycopg cannot use the
+'ProactorEventLoop'"), and the launcher selects a compatible loop for you. It
+changes nothing on other platforms.
 
 ## Responsible AI
 

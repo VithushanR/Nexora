@@ -4,7 +4,10 @@ Agent 2 -- Retrieval & Screening
 Node signature matches the LangGraph pattern used across the pipeline:
 
     async def retrieval_screening_node(state: ResearchState) -> dict:
-        candidates = await run_retrieval_and_screening(state["protocol"])
+        limits = get_tier_config(state["tier"])
+        candidates = await run_retrieval_and_screening(
+            state["protocol"], candidate_cap=limits.candidate_cap, concurrency=limits.concurrency,
+        )
         return {"candidates": candidates}
 
 Pipeline (per the Agent Build Reference):
@@ -17,7 +20,7 @@ Pipeline (per the Agent Build Reference):
      sources keeps whichever source found the better lead.
   3. Pre-rank -- BM25 against the inclusion criteria. No LLM call. Used
      for ordering only, never decides inclusion.
-  4. Cap -- top N (SCREENING_CANDIDATE_CAP) by pre-rank score reach the
+  4. Cap -- top N (the user's tier candidate_cap) by pre-rank score reach the
      LLM; everything below the cap is dropped before any LLM cost.
   5. LLM screening -- one call per capped candidate, via backend.llm.client.
      Every verdict must carry a quote that is verified as a real substring
@@ -41,9 +44,12 @@ from backend.sources import openalex, semantic_scholar, arxiv, europepmc
 from backend.sources.base import SourceUnavailableError
 from backend.llm.client import llm_json_call
 from backend.graph.state import ResearchState, Candidate, Protocol
+from backend.tiers import get_tier_config
 
 logger = logging.getLogger("nexora.agent2")
 
+# Standalone-use defaults only (scripts, manual testing) -- retrieval_screening_node
+# always passes tier-derived values from backend/tiers.py instead.
 SCREENING_CANDIDATE_CAP = int(os.getenv("SCREENING_CANDIDATE_CAP", "150"))
 MIN_ABSTRACT_CHARS = 50  # below this, skip the LLM call -- see screen_candidate
 
@@ -186,7 +192,7 @@ def compute_paper_url(candidate: Candidate) -> Optional[str]:
 # Step 3-4: BM25 pre-rank + cap (deterministic, no LLM)
 # ------------------------------------------------------------------
 
-def prerank_and_cap(candidates: list[Candidate], protocol: Protocol, cap: int = SCREENING_CANDIDATE_CAP) -> list[Candidate]:
+def prerank_and_cap(candidates: list[Candidate], protocol: Protocol, cap: int) -> list[Candidate]:
     if not candidates:
         return []
 
@@ -273,7 +279,7 @@ PAPER ABSTRACT:
     return {"verdict": result["verdict"], "quote": result.get("quote", ""), "reason": result.get("reason", "")}
 
 
-async def screen_all(candidates: list[Candidate], protocol: Protocol, concurrency: int = SCREENING_LLM_CONCURRENCY) -> list[Candidate]:
+async def screen_all(candidates: list[Candidate], protocol: Protocol, concurrency: int) -> list[Candidate]:
     """Screens the capped candidate list. Bounded concurrency (not full
     fan-out) so screening 150 candidates doesn't slam the Gemini rate
     limit -- adjust `concurrency` against your account's actual per-minute
@@ -307,7 +313,13 @@ def sort_by_verdict(candidates: list[Candidate]) -> list[Candidate]:
 # Orchestration + LangGraph node
 # ------------------------------------------------------------------
 
-async def run_retrieval_and_screening(protocol: Protocol) -> list[Candidate]:
+async def run_retrieval_and_screening(
+    protocol: Protocol,
+    candidate_cap: int = SCREENING_CANDIDATE_CAP,
+    concurrency: int = SCREENING_LLM_CONCURRENCY,
+) -> list[Candidate]:
+    """candidate_cap/concurrency default to the env-var values for standalone
+    calls only; retrieval_screening_node always passes tier-derived values."""
     raw, unreachable = await retrieve_all_sources(protocol)
     if unreachable:
         logger.warning("Sources unreachable this run: %s", unreachable)
@@ -317,14 +329,14 @@ async def run_retrieval_and_screening(protocol: Protocol) -> list[Candidate]:
     for c in deduped:
         c["paper_url"] = compute_paper_url(c)
 
-    capped = prerank_and_cap(deduped, protocol)
+    capped = prerank_and_cap(deduped, protocol, cap=candidate_cap)
     logger.info("Capped to top %d of %d for LLM screening", len(capped), len(deduped))
     # Relative to this batch's own top score only -- see apply_relevance_percent's
     # docstring. Computed once here, after every candidate that will ever reach
     # the user (the capped set) has its final prerank_score.
     apply_relevance_percent(capped)
 
-    screened = await screen_all(capped, protocol)
+    screened = await screen_all(capped, protocol, concurrency=concurrency)
 
     for c in screened:
         c["has_usable_abstract"] = len((c.get("abstract") or "").strip()) >= MIN_ABSTRACT_CHARS
@@ -346,5 +358,13 @@ async def retrieval_screening_node(state: ResearchState) -> dict:
             "retrieval_screening_node requires state['protocol'] to already "
             "be set -- Agent 1 (protocol_planning_node) must run before Agent 2."
         )
-    candidates = await run_retrieval_and_screening(protocol)
+    tier = state.get("tier")
+    if tier is None:
+        # Same fail-loud guard as `protocol` above: the caller must seed the
+        # account tier -- silently defaulting would hand a user the wrong limits.
+        raise ValueError("retrieval_screening_node requires state['tier'] to be set.")
+    limits = get_tier_config(tier)
+    candidates = await run_retrieval_and_screening(
+        protocol, candidate_cap=limits.candidate_cap, concurrency=limits.concurrency,
+    )
     return {"candidates": candidates}

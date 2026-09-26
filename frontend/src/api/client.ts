@@ -3,13 +3,10 @@
 
 import type {
   CandidatesResponse,
-  CopilotAddToEvidenceResponse,
-  CopilotChatMode,
-  CopilotChatResponse,
-  CopilotHistoryEntry,
+  ChatHistoryMessage,
+  ChatRequestMode,
+  ChatResponse,
   CopilotIndexResponse,
-  DocumentChatHistoryEntry,
-  DocumentChatResponse,
   DocumentUploadResponse,
   ResearchStartRequest,
   ResearchStartResponse,
@@ -323,8 +320,8 @@ export async function downloadResearchReportPdf(threadId: string): Promise<Blob>
 }
 
 // ---------------------------------------------------------------------------
-// Report Copilot (backend/routers/copilot.py). Response shapes match that
-// router's Pydantic models exactly -- see types/index.ts.
+// Report indexing (backend/routers/copilot.py). Called once a Deep Search
+// report is finished so chat can ground on it.
 // ---------------------------------------------------------------------------
 
 export async function indexCopilot(threadId: string): Promise<CopilotIndexResponse> {
@@ -333,64 +330,58 @@ export async function indexCopilot(threadId: string): Promise<CopilotIndexRespon
   });
 }
 
-export async function sendCopilotMessage(
-  threadId: string,
-  message: string,
-  mode: CopilotChatMode,
-): Promise<CopilotChatResponse> {
-  return requestJson<CopilotChatResponse>(researchPath(threadId, "/copilot/chat"), {
+// ---------------------------------------------------------------------------
+// The one chat endpoint (backend/routers/chat.py). The backend decides how
+// to answer from the mode and what the request carries: web mode always
+// searches the web; chat mode grounds on the thread's finished report and/or
+// the attached documents when present, and otherwise replies conversationally.
+// ---------------------------------------------------------------------------
+
+export interface SendChatOptions {
+  message: string;
+  mode: ChatRequestMode;
+  sessionId: string;
+  threadId?: string | null;
+  documentIds?: string[];
+}
+
+export async function sendChat({ message, mode, sessionId, threadId, documentIds }: SendChatOptions): Promise<ChatResponse> {
+  return requestJson<ChatResponse>("/chat", {
     method: "POST",
-    body: JSON.stringify({ message, mode }),
+    body: JSON.stringify({
+      message,
+      mode,
+      session_id: sessionId,
+      thread_id: threadId ?? null,
+      document_ids: documentIds ?? [],
+    }),
   });
 }
 
-export async function addToEvidence(
-  threadId: string,
-  messageId: string,
-): Promise<CopilotAddToEvidenceResponse> {
-  return requestJson<CopilotAddToEvidenceResponse>(
-    researchPath(threadId, "/copilot/add_to_evidence"),
-    {
-      method: "POST",
-      body: JSON.stringify({ message_id: messageId }),
-    },
-  );
-}
-
-export async function getCopilotHistory(threadId: string): Promise<CopilotHistoryEntry[]> {
-  return requestJson<CopilotHistoryEntry[]>(researchPath(threadId, "/copilot/history"));
+// The stored conversation for a chat session and/or Deep Search thread, oldest
+// first -- what restores the thread after a refresh or a backend restart.
+export async function getChatHistory(scope: { sessionId?: string; threadId?: string | null }): Promise<ChatHistoryMessage[]> {
+  const query = new URLSearchParams();
+  if (scope.sessionId) query.set("session_id", scope.sessionId);
+  if (scope.threadId) query.set("thread_id", scope.threadId);
+  return requestJson<ChatHistoryMessage[]>(`/chat/history?${query.toString()}`);
 }
 
 // ---------------------------------------------------------------------------
-// General chat (backend/routers/chat.py) -- no document, no research
-// thread. Used by Chat mode when there's nothing yet to ground a response
-// in; a real (Gemini-backed) but short, scoped reply, not a canned string.
-// ---------------------------------------------------------------------------
-
-export interface GeneralChatResponse {
-  reply: string;
-}
-
-export async function sendGeneralChat(message: string): Promise<GeneralChatResponse> {
-  return requestJson<GeneralChatResponse>("/chat", {
-    method: "POST",
-    body: JSON.stringify({ message }),
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Document upload + single-paper chat (backend/routers/documents.py).
-// Response shapes match that router's plain-dict returns exactly -- note
-// this is a genuinely different contract from Copilot above (no "mode",
-// page-level sources instead of evidence_row/web-typed ones), so these are
-// deliberately separate functions rather than one shared "chat" helper.
+// Document upload / open / delete (backend/routers/documents.py). Chatting
+// about a document goes through sendChat above, not a document endpoint.
 // ---------------------------------------------------------------------------
 
 function documentPath(documentId: string, suffix = ""): string {
   return `/documents/${encodeURIComponent(documentId)}${suffix}`;
 }
 
-export async function uploadDocument(file: File): Promise<DocumentUploadResponse> {
+export interface DocumentScope {
+  sessionId: string;
+  threadId?: string | null;
+}
+
+export async function uploadDocument(file: File, scope: DocumentScope): Promise<DocumentUploadResponse> {
   const authHeaders = authHeadersProvider ? await authHeadersProvider() : {};
   const headers = new Headers();
   for (const [name, value] of Object.entries(authHeaders)) {
@@ -401,6 +392,8 @@ export async function uploadDocument(file: File): Promise<DocumentUploadResponse
   // boundary the browser needs to set itself for FormData uploads.
   const formData = new FormData();
   formData.append("file", file);
+  formData.append("session_id", scope.sessionId);
+  if (scope.threadId) formData.append("thread_id", scope.threadId);
 
   let response: Response;
   try {
@@ -425,20 +418,38 @@ export async function uploadDocument(file: File): Promise<DocumentUploadResponse
   return payload as DocumentUploadResponse;
 }
 
-export async function sendDocumentChat(
-  documentId: string,
-  message: string,
-): Promise<DocumentChatResponse> {
-  return requestJson<DocumentChatResponse>(documentPath(documentId, "/chat"), {
-    method: "POST",
-    body: JSON.stringify({ message }),
-  });
+// The documents uploaded in this chat session and/or Deep Search thread --
+// what restores the folder panel after a refresh.
+export async function listDocuments(scope: { sessionId?: string; threadId?: string | null }): Promise<DocumentUploadResponse[]> {
+  const query = new URLSearchParams();
+  if (scope.sessionId) query.set("session_id", scope.sessionId);
+  if (scope.threadId) query.set("thread_id", scope.threadId);
+  return requestJson<DocumentUploadResponse[]>(`/documents?${query.toString()}`);
 }
 
-export async function getDocumentChatHistory(
-  documentId: string,
-): Promise<DocumentChatHistoryEntry[]> {
-  return requestJson<DocumentChatHistoryEntry[]>(documentPath(documentId, "/chat/history"));
+// The PDF is encrypted at rest and has no static URL: this fetches the
+// decrypted bytes with the auth header (owner-only on the server) so the
+// caller can open them as a blob.
+export async function fetchDocumentFile(documentId: string): Promise<Blob> {
+  const authHeaders = authHeadersProvider ? await authHeadersProvider() : {};
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(authHeaders)) {
+    headers.set(name, value);
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${getBaseUrl()}${documentPath(documentId, "/file")}`, { headers });
+  } catch {
+    throw new ApiNetworkError("Unable to connect to the research service.");
+  }
+
+  if (!response.ok) {
+    const payload = await parseJson(response);
+    const detail = responseDetail(payload, "The document could not be opened.");
+    throw new ApiClientError(response.status, detail.message, detail.code);
+  }
+  return response.blob();
 }
 
 export async function deleteDocument(documentId: string): Promise<{ deleted: true }> {

@@ -1,39 +1,30 @@
 """
-Report Copilot router (Part B).
+Report indexing for chat (Part B).
 
 Responsibility:
-- POST /research/{thread_id}/copilot/index         index a finished report for RAG chat
-- POST /research/{thread_id}/copilot/chat          answer a question, grounded in the
-                                                    report ("report" mode) or with live
-                                                    tool-calling over report + web ("auto")
-- POST /research/{thread_id}/copilot/add_to_evidence   promote a web-sourced answer into
-                                                        the report's own retrieval index
-- GET  /research/{thread_id}/copilot/history       chat history for the sidebar
+- POST /research/{thread_id}/copilot/index   index a finished report so the
+  merged chat router (routers/chat.py) can ground answers in it
+
+Chatting itself -- report-grounded, document-grounded, general and web
+search -- no longer lives here: it is one code path in routers/chat.py,
+keyed off the thread's state. This module only turns a finished report into
+a searchable RAG namespace.
 
 Part B's only input is the `report` dict produced by the pipeline (see
-backend/report/store.py for the exact contract shape) -- no other field is
-assumed to exist. Auth (backend.auth.jwt.get_current_user) and thread
-ownership (backend.research_threads.get_thread/verify_thread_owner) are the
-same real, shared implementation backend/routers/research.py uses -- this
-router no longer has its own placeholder auth. RAG retrieval
-(backend.rag.chat) and prompt sanitization (backend.auth.sanitize) are
-Part D's real implementations; report persistence (backend.report.store)
-remains a stub -- see that file for what still needs replacing.
+backend/report/store.py for the exact contract shape). Auth
+(backend.auth.jwt.get_current_user) and thread ownership
+(backend.research_threads.get_thread/verify_thread_owner) are the same real,
+shared implementation backend/routers/research.py uses.
 """
 
 import asyncio
 import logging
-from datetime import datetime, timezone
-from typing import Literal, Optional, Union, cast
-from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from backend.auth.jwt import get_current_user
-from backend.auth.sanitize import sanitize_for_prompt
-from backend.llm.client import llm_json_call
-from backend.rag.chat import build_index, query, rag_chat
+from backend.rag.chat import build_index
 from backend.report.store import get_report
 from backend.research_threads import get_thread, verify_thread_owner
 
@@ -41,86 +32,17 @@ logger = logging.getLogger("nexora.copilot")
 
 router = APIRouter(prefix="/research", tags=["copilot"])
 
-MAX_MESSAGE_CHARS = 2000
-
-ChatMode = Literal["report", "auto"]
-AnswerMode = Literal["report", "web"]
-
-
-# ============================================================
-# Request / response models
-# ============================================================
-
 
 class IndexResponse(BaseModel):
     indexed: bool
     n_chunks: int
 
 
-class ChatRequest(BaseModel):
-    message: str
-    mode: ChatMode
-
-
-class SourceEvidenceRow(BaseModel):
-    type: Literal["evidence_row"] = "evidence_row"
-    paper_title: str
-
-
-class SourceWeb(BaseModel):
-    type: Literal["web"] = "web"
-    url: str
-    title: str
-
-
-Source = Union[SourceEvidenceRow, SourceWeb]
-
-
-class ChatResponse(BaseModel):
-    message_id: str
-    answer: str
-    mode: AnswerMode
-    sources: list[Source] = Field(default_factory=list)
-
-
-class AddToEvidenceRequest(BaseModel):
-    message_id: str
-
-
-class AddToEvidenceResponse(BaseModel):
-    added: bool
-
-
-class HistoryEntry(BaseModel):
-    message_id: str
-    role: Literal["user", "assistant"]
-    content: str
-    mode: Optional[AnswerMode] = None
-    timestamp: str
-
-
-# ============================================================
-# Per-thread chat history store
-# ============================================================
-# STUB -- replace with a real per-thread DB table (e.g. SQLite). Using an
-# in-memory dict keyed by thread_id since there is no DB wiring yet. This
-# does not persist across process restarts and is not shared across
-# worker processes.
-
-_HISTORY: dict[str, list[HistoryEntry]] = {}
-
-# thread_id -> the exact chunk list last handed to build_index(). Needed
-# because rag.chat.build_index() REPLACES a namespace's chunks wholesale
-# (it has no incremental-append operation), so appending one new chunk
-# (add_to_evidence) requires resending the full set.
-_LAST_CHUNKS: dict[str, list[str]] = {}
-
-
-def _namespace(thread_id: str) -> str:
+def report_namespace(thread_id: str) -> str:
     return f"report:{thread_id}"
 
 
-async def _require_owned_thread(thread_id: str, user_id: str) -> None:
+async def require_owned_thread(thread_id: str, user_id: str) -> None:
     """Raises 404 (not 403) if the thread doesn't exist or isn't owned by
     user_id -- matching backend/routers/research.py's _owned_thread_or_404
     exactly, so a non-owner can't distinguish "doesn't exist" from "exists,
@@ -128,10 +50,6 @@ async def _require_owned_thread(thread_id: str, user_id: str) -> None:
     thread = await get_thread(thread_id)
     if thread is None or not await verify_thread_owner(thread_id, user_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Research thread not found.")
-
-
-def _append_history(thread_id: str, entry: HistoryEntry) -> None:
-    _HISTORY.setdefault(thread_id, []).append(entry)
 
 
 # ============================================================
@@ -198,156 +116,22 @@ def _warn_if_incomplete(thread_id: str, report: dict) -> None:
         )
 
 
-# ============================================================
-# "auto" mode tool-calling
-# ============================================================
-# The shared LLM client (backend/llm/client.py) only exposes a plain
-# JSON-in-JSON-out call, not a native function-calling API. Tool-calling
-# here is therefore a manual two-step loop, matching the JSON-prompting
-# pattern already used throughout backend/agents/: (1) ask the model which
-# tool(s) apply, (2) execute those tools, (3) ask the model to synthesize
-# an answer from what came back.
-
-TOOL_DECISION_SYSTEM_PROMPT = """You are a research copilot deciding which tools to use to answer a user's question.
-
-Two tools are available:
-- "search_report": searches the already-completed research report (its evidence table, contradictions and research gaps).
-- "search_web": performs a live web search for information the report does not cover.
-
-Use "search_report" when the question is about the analysed papers, their findings, contradictions, or gaps.
-Use "search_web" when the question asks about something outside the report -- recent developments, background facts, anything not among the analysed papers.
-Use both if genuinely useful for the question.
-
-Respond ONLY with valid JSON, no markdown fences:
-{"tools": ["search_report"]}"""
-
-SYNTHESIS_SYSTEM_PROMPT = """You answer the user's question using ONLY the CONTEXT provided below, which was gathered by tools called on their behalf.
-Never invent information that is not present in the CONTEXT. If the CONTEXT is insufficient to answer, say so plainly.
-
-Respond ONLY with valid JSON, no markdown fences:
-{"answer": "..."}"""
-
-VALID_TOOLS = ("search_report", "search_web")
-
-
-def _degrade_reason(result: Optional[dict]) -> str:
-    if not result:
-        return "the model's response could not be parsed"
-    if result.get("_budget_exhausted"):
-        return "LLM budget exhausted"
-    if result.get("_blocked_or_empty"):
-        return "the model returned an empty response"
-    return "an unknown error"
-
-
-def _is_degraded(result: Optional[dict]) -> bool:
-    return not result or bool(result.get("_budget_exhausted")) or bool(result.get("_blocked_or_empty"))
-
-
-def _chunk_title(chunk_text: str) -> str:
-    """Recovers a display title from a chunk built by chunk_report().
-    rag.chat.build_index() only accepts plain strings (no metadata), so the
-    title has to be pulled back out of the chunk's own text -- this mirrors
-    the "{title}\\n\\n..." format chunk_report() writes for evidence rows.
-    Good enough for a citation label; not meant to be exact for
-    contradiction/gap chunks, which don't have a single "title" concept.
-    """
-    first_line = chunk_text.split("\n\n", 1)[0].strip()
-    return first_line or "(untitled)"
-
-
-async def _web_search(search_query: str) -> list[dict]:
-    """search_web tool implementation.
-
-    STUB -- no real web search provider (Bing/SerpAPI/etc.) is wired into
-    this repo yet. This placeholder returns a single canned result so the
-    "auto" mode control flow (tool selection -> tool execution ->
-    synthesis -> mode="web" tagging) can be built and tested end-to-end.
-    A real implementation MUST keep safe-search explicitly enabled in its
-    request parameters (e.g. `safe=active` / `safesearch=strict`) -- do not
-    drop that when wiring in a real provider.
-    """
-    logger.warning("copilot: using stub web search (no provider wired) for query=%r", search_query[:80])
-    return [
-        {
-            "title": f"Stub web result for: {search_query[:60]}",
-            "url": "https://example.com/search-stub",
-            "snippet": (
-                "This is placeholder content from the web-search stub -- no real "
-                "search provider is wired into this repo yet."
-            ),
-        }
-    ]
-
-
-async def _run_report_mode(namespace: str, question: str) -> tuple[str, list[dict]]:
-    # rag.chat's build_index/query/rag_chat are synchronous, blocking calls
-    # (real embedding + disk I/O + a synchronous Gemini request) -- run them
-    # off the event loop rather than blocking every other request.
-    hits = await asyncio.to_thread(query, namespace, question, top_k=5)
-    sources = [{"type": "evidence_row", "paper_title": _chunk_title(h.get("text", ""))} for h in hits]
-    answer = await asyncio.to_thread(rag_chat, namespace, question)
-    return answer, sources
-
-
-async def _run_auto_mode(namespace: str, question: str) -> tuple[str, AnswerMode, list[dict]]:
-    decision = await llm_json_call(
-        TOOL_DECISION_SYSTEM_PROMPT, question, debug_label="copilot.decide_tools",
-    )
-    if _is_degraded(decision):
-        reason = _degrade_reason(decision)
-        return f"I couldn't process that question right now ({reason}).", "report", []
-
-    assert decision is not None
-    requested = decision.get("tools")
-    tools = [t for t in requested if t in VALID_TOOLS] if isinstance(requested, list) else []
-    if not tools:
-        tools = ["search_report"]  # safe default: always at least check the report
-
-    sources: list[dict] = []
-    context_parts: list[str] = []
-
-    if "search_report" in tools:
-        for hit in await asyncio.to_thread(query, namespace, question, top_k=5):
-            text = hit.get("text", "")
-            sources.append({"type": "evidence_row", "paper_title": _chunk_title(text)})
-            context_parts.append(text)
-
-    if "search_web" in tools:
-        for hit in await _web_search(question):
-            sources.append({"type": "web", "url": hit["url"], "title": hit["title"]})
-            context_parts.append(f"{hit['title']}: {hit.get('snippet', '')}")
-
-    mode: AnswerMode = "web" if "search_web" in tools else "report"
-    context = "\n\n---\n\n".join(context_parts) if context_parts else "(no context retrieved)"
-
-    synthesis = await llm_json_call(
-        SYNTHESIS_SYSTEM_PROMPT,
-        f"CONTEXT:\n{context}\n\nQUESTION: {question}",
-        debug_label="copilot.synthesize",
-    )
-    if _is_degraded(synthesis):
-        reason = _degrade_reason(synthesis)
-        return f"I couldn't process that question right now ({reason}).", mode, sources
-
-    assert synthesis is not None
-    answer = (synthesis.get("answer") or "").strip()
-    if not answer:
-        return "I couldn't process that question right now (no answer returned).", mode, sources
-
-    return answer, mode, sources
-
 
 # ============================================================
-# Endpoints
+# Endpoint
 # ============================================================
 
 
 @router.post("/{thread_id}/copilot/index", response_model=IndexResponse)
 async def index_report(thread_id: str, user_id: str = Depends(get_current_user)) -> IndexResponse:
-    await _require_owned_thread(thread_id, user_id)
+    await require_owned_thread(thread_id, user_id)
 
-    report = get_report(thread_id)
+    report = await get_report(thread_id)
+    if report is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No finished report exists for this research thread yet.",
+        )
     _warn_if_incomplete(thread_id, report)
 
     chunks = chunk_report(report)
@@ -356,79 +140,6 @@ async def index_report(thread_id: str, user_id: str = Depends(get_current_user))
     # an empty/incomplete report is still indexed for whatever real content
     # it does have, which can legitimately be zero chunks).
     if chunks:
-        await asyncio.to_thread(build_index, chunks, namespace=_namespace(thread_id))
-    _LAST_CHUNKS[thread_id] = chunks
+        await asyncio.to_thread(build_index, chunks, namespace=report_namespace(thread_id))
 
     return IndexResponse(indexed=True, n_chunks=len(chunks))
-
-
-@router.post("/{thread_id}/copilot/chat", response_model=ChatResponse)
-async def chat(
-    thread_id: str, request: ChatRequest, user_id: str = Depends(get_current_user),
-) -> ChatResponse:
-    await _require_owned_thread(thread_id, user_id)
-
-    if len(request.message) > MAX_MESSAGE_CHARS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"message must be {MAX_MESSAGE_CHARS} characters or fewer",
-        )
-
-    sanitized = sanitize_for_prompt(request.message)
-    namespace = _namespace(thread_id)
-
-    if request.mode == "report":
-        answer, sources = await _run_report_mode(namespace, sanitized)
-        mode: AnswerMode = "report"
-    else:
-        answer, mode, sources = await _run_auto_mode(namespace, sanitized)
-
-    now = datetime.now(timezone.utc).isoformat()
-    message_id = str(uuid4())
-
-    _append_history(thread_id, HistoryEntry(
-        message_id=str(uuid4()), role="user", content=sanitized, mode=None, timestamp=now,
-    ))
-    _append_history(thread_id, HistoryEntry(
-        message_id=message_id, role="assistant", content=answer, mode=mode, timestamp=now,
-    ))
-
-    return ChatResponse(
-        message_id=message_id,
-        answer=answer,
-        mode=mode,
-        sources=cast(list[Source], sources),
-    )
-
-
-@router.post("/{thread_id}/copilot/add_to_evidence", response_model=AddToEvidenceResponse)
-async def add_to_evidence(
-    thread_id: str, request: AddToEvidenceRequest, user_id: str = Depends(get_current_user),
-) -> AddToEvidenceResponse:
-    await _require_owned_thread(thread_id, user_id)
-
-    entries = _HISTORY.get(thread_id, [])
-    entry = next(
-        (e for e in entries if e.message_id == request.message_id and e.role == "assistant"),
-        None,
-    )
-    if entry is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="message not found")
-    if entry.mode != "web":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="only web-mode answers can be added to evidence",
-        )
-
-    existing_chunks = list(_LAST_CHUNKS.get(thread_id, []))
-    existing_chunks.append(entry.content)
-    await asyncio.to_thread(build_index, existing_chunks, namespace=_namespace(thread_id))
-    _LAST_CHUNKS[thread_id] = existing_chunks
-
-    return AddToEvidenceResponse(added=True)
-
-
-@router.get("/{thread_id}/copilot/history", response_model=list[HistoryEntry])
-async def get_history(thread_id: str, user_id: str = Depends(get_current_user)) -> list[HistoryEntry]:
-    await _require_owned_thread(thread_id, user_id)
-    return _HISTORY.get(thread_id, [])

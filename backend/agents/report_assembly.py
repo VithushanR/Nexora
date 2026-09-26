@@ -461,7 +461,7 @@ async def report_assembly_node(state: ResearchState) -> dict:
             "introduction_status": introduction_status,
         },
     )
-    register_report(thread_id, build_structured_report(report_state))
+    await register_report(thread_id, build_structured_report(report_state))
 
     return {
         "introduction": introduction,

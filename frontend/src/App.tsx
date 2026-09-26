@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import Sidebar from "./components/Sidebar";
 import SearchPage from "./pages/SearchPage";
-import UploadPage from "./pages/UploadPage";
 import LoginPage from "./pages/LoginPage";
 import { AuthProvider, useAuth } from "./auth/AuthContext";
 
@@ -106,7 +105,6 @@ function AppShell({
               from "Saved research") into that same unified view, rather
               than a separate selection/report page. */}
           <Route path="/t/:threadId" element={<SearchPage />} />
-          <Route path="/upload" element={<UploadPage />} />
         </Routes>
       </main>
     </div>

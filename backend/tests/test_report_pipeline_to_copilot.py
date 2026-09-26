@@ -26,7 +26,7 @@ from langgraph.graph import StateGraph, START, END
 import backend.routers.copilot as copilot
 from backend.agents.report_assembly import generate_introduction, report_assembly_node
 from backend.graph.state import ResearchState
-from backend.report.store import get_report, SAMPLE_REPORT
+from backend.tests.sample_report import SAMPLE_REPORT
 
 MODULE = "backend.routers.copilot"
 
@@ -118,15 +118,30 @@ async def _fake_verify_thread_owner(thread_id: str, user_id: str) -> bool:
     return thread_id == THREAD_ID and user_id == USER_ID
 
 
+# What report_assembly_node registers, keyed by thread -- stands in for the
+# Postgres report store (its real round-trip is tested in
+# test_postgres_stores.py), so this test is about the assembly -> index
+# hand-off and needs no database.
+_STORED_REPORTS: dict[str, dict] = {}
+
+
+async def _fake_register_report(thread_id: str, report: dict) -> None:
+    _STORED_REPORTS[thread_id] = report
+
+
+async def _fake_get_report(thread_id: str):
+    return _STORED_REPORTS.get(thread_id)
+
+
 @pytest.fixture(autouse=True)
 def _reset_copilot_state(monkeypatch):
-    copilot._HISTORY.clear()
-    copilot._LAST_CHUNKS.clear()
+    _STORED_REPORTS.clear()
     monkeypatch.setattr(copilot, "get_thread", _fake_get_thread)
     monkeypatch.setattr(copilot, "verify_thread_owner", _fake_verify_thread_owner)
+    monkeypatch.setattr(copilot, "get_report", _fake_get_report)
+    monkeypatch.setattr("backend.agents.report_assembly.register_report", _fake_register_report)
     yield
-    copilot._HISTORY.clear()
-    copilot._LAST_CHUNKS.clear()
+    _STORED_REPORTS.clear()
 
 
 @pytest.mark.asyncio
@@ -160,7 +175,7 @@ async def test_report_assembly_registers_real_report_for_copilot_indexing():
 
     # register_report() ran for THIS thread_id with THIS thread's data --
     # not the sample.
-    registered = get_report(THREAD_ID)
+    registered = _STORED_REPORTS[THREAD_ID]
     assert registered is not SAMPLE_REPORT
     assert registered["domain"] == "graph neural networks for molecular property prediction"
 

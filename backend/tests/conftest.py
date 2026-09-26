@@ -52,12 +52,15 @@ os.environ.setdefault("GOOGLE_OAUTH_CLIENT_ID", "nexora-test-only.apps.googleuse
 os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 
+_POSTGRES_TEST_FILES = {"test_research_threads.py", "test_postgres_stores.py"}
+
+
 def pytest_asyncio_loop_factories(
     config: pytest.Config,
     item: pytest.Item,
 ):
     """Use psycopg-compatible selector loops for PostgreSQL integration tests."""
-    if sys.platform == "win32" and item.path.name == "test_research_threads.py":
+    if sys.platform == "win32" and item.path.name in _POSTGRES_TEST_FILES:
         return {"windows_selector": asyncio.SelectorEventLoop}
 
     return {"default": asyncio.new_event_loop}

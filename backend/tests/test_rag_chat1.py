@@ -24,7 +24,6 @@ What this suite checks that a first pass often misses:
 
 import json
 import os
-import shutil
 from pathlib import Path
 
 import pytest
@@ -34,7 +33,6 @@ from rag.chat import (
     build_index,
     query,
     rag_chat,
-    _INDEX_STORE_DIR,
     _index_path,
     _chunks_path,
     _sanitize_namespace,
@@ -59,20 +57,14 @@ def load_fake_data():
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def clean_index_store():
+def clean_index_store(tmp_path, monkeypatch):
     """
-    Wipes index_store/ before and after every test so this suite never
-    leaks state into itself or into a separately-run suite.
+    Each test gets its own empty index directory so this suite never leaks
+    state into itself or a separately-run suite -- and never touches the
+    real backend/rag/index_store/.
     """
-    if os.path.exists(_INDEX_STORE_DIR):
-        shutil.rmtree(_INDEX_STORE_DIR)
-
-    os.makedirs(_INDEX_STORE_DIR, exist_ok=True)
-
+    monkeypatch.setattr(rag_chat_module, "_INDEX_STORE_DIR", str(tmp_path))
     yield
-
-    if os.path.exists(_INDEX_STORE_DIR):
-        shutil.rmtree(_INDEX_STORE_DIR)
 
 
 # ---------------------------------------------------------------------------
