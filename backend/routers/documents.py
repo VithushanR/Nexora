@@ -1,17 +1,22 @@
 """
 backend/routers/documents.py
 
-Part D — Document Upload, Single-Paper Chat.
+Part D — Document upload, listing, viewing and deletion.
 
-Owns: this file, backend/uploads/ (storage dir)
-Depends on: backend/auth/jwt.py (get_current_user), backend/auth/sanitize.py
-            (sanitize_for_prompt), backend/rag/chat.py (build_index, rag_chat)
+Owns: this file, backend/uploads/ (encrypted PDFs on disk)
+Depends on: backend/documents_store.py (Postgres metadata),
+            backend/auth/jwt.py (get_current_user),
+            backend/auth/sanitize.py (sanitize_for_prompt),
+            backend/rag/chat.py (build_index)
 
-Endpoints (per handoff doc §D.1):
-    POST   /documents/upload                        -> {document_id, title, n_pages}
-    POST   /documents/{document_id}/chat             -> {message_id, answer, sources}
-    GET    /documents/{document_id}/chat/history      -> [{message_id, role, content, timestamp}, ...]
-    DELETE /documents/{document_id}                  -> {deleted: true}
+Endpoints:
+    POST   /documents/upload            -> {document_id, title, n_pages}
+    GET    /documents?session_id=&thread_id=  -> [{document_id, title, n_pages}, ...]
+    GET    /documents/{document_id}/file -> the decrypted PDF (owner-only)
+    DELETE /documents/{document_id}      -> {deleted: true}
+
+Chatting about a document lives in routers/chat.py (one merged chat
+router: general, document/report-grounded, and web-search chat).
 
 Upload validation order (non-negotiable, §D.1):
     1. Reject if Content-Length exceeds UPLOAD_MAX_SIZE_MB
@@ -25,22 +30,27 @@ Upload validation order (non-negotiable, §D.1):
 Every document-scoped route is owner-only: a user can only touch their
 own documents. A document that exists but belongs to someone else
 returns 404 (not 403), so a non-owner can't distinguish "doesn't exist"
-from "exists, not yours" -- see _get_owned_document_or_404.
+from "exists, not yours" -- see get_owned_document_or_404.
 """
 
+import logging
 import os
 import re
-import sqlite3
 import uuid
-from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response, UploadFile, status
 from pypdf import PdfReader
 
-from backend.auth.encryption import encrypt_bytes
+from backend import documents_store
+from backend.auth.encryption import decrypt_bytes, encrypt_bytes
 from backend.auth.jwt import get_current_user
 from backend.auth.sanitize import sanitize_for_prompt
-from backend.rag.chat import build_index, rag_chat
+from backend.documents_store import Document
+from backend.rag.chat import build_index
+from backend.routers.copilot import require_owned_thread
+
+logger = logging.getLogger("nexora.documents")
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -56,15 +66,13 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 UPLOAD_MAX_SIZE_MB = int(os.environ.get("UPLOAD_MAX_SIZE_MB", "20"))
 UPLOAD_MAX_SIZE_BYTES = UPLOAD_MAX_SIZE_MB * 1024 * 1024
 
-_DB_PATH = os.path.join(UPLOAD_DIR, "documents.db")
+MAX_ID_CHARS = 128
 
 # Real PDF files start with this byte sequence ("%PDF-"). Checking this
 # instead of trusting the filename/extension is the whole point of step 2
 # in the upload validation order -- a renamed .exe or .html file with a
 # ".pdf" extension will fail this check.
 _PDF_MAGIC_BYTES = b"%PDF-"
-
-_MAX_MESSAGE_LENGTH = 2000  # server-side cap, per B.4-style checklist pattern
 
 # Chunking: simple fixed-size window with overlap. Good enough for RAG
 # over a single paper -- no need for anything fancier here.
@@ -73,87 +81,29 @@ _CHUNK_OVERLAP_CHARS = 150
 
 
 # ---------------------------------------------------------------------------
-# SQLite setup — document_id -> {user_id, title, n_pages, file_path, created_at}
-# and per-document chat history, matching Part A's thread_id table pattern.
-# ---------------------------------------------------------------------------
-
-def _get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
-def _init_db() -> None:
-    conn = _get_db()
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS documents (
-                document_id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                n_pages INTEGER NOT NULL,
-                file_path TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS document_chat_history (
-                message_id TEXT PRIMARY KEY,
-                document_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                FOREIGN KEY (document_id) REFERENCES documents(document_id)
-            )
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-_init_db()
-
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _document_namespace(document_id: str) -> str:
+def document_namespace(document_id: str) -> str:
     """Matches the frozen convention from rag/chat.py: 'document:{document_id}'."""
     return f"document:{document_id}"
 
 
-def _get_owned_document_or_404(document_id: str, user_id: str) -> sqlite3.Row:
+async def get_owned_document_or_404(document_id: str, user_id: str) -> Document:
     """
-    Fetches a document row and verifies ownership in one step.
+    Fetches a document and verifies ownership in one step.
 
     Returns 404 (not 403) when the document exists but belongs to someone
     else, so a non-owner can't distinguish "doesn't exist" from "exists,
     not yours" -- this avoids confirming other users' document_ids exist
     at all.
     """
-    conn = _get_db()
-    try:
-        row = conn.execute(
-            "SELECT * FROM documents WHERE document_id = ?", (document_id,)
-        ).fetchone()
-    finally:
-        conn.close()
-
-    if row is None or row["user_id"] != user_id:
+    document = await documents_store.get_document(document_id)
+    if document is None or document.user_id != user_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Document not found"
         )
-    return row
+    return document
 
 
 def _chunk_text(text: str) -> list[str]:
@@ -197,7 +147,7 @@ def _delete_rag_index_files(document_id: str) -> None:
     """
     from backend.rag.chat import _INDEX_STORE_DIR  # local import: internal detail, not part of the frozen public interface
 
-    namespace = _document_namespace(document_id)
+    namespace = document_namespace(document_id)
     sanitized = re.sub(r"[^a-zA-Z0-9_\-]", "_", namespace)
 
     index_path = os.path.join(_INDEX_STORE_DIR, f"{sanitized}.faiss")
@@ -208,6 +158,11 @@ def _delete_rag_index_files(document_id: str) -> None:
             os.remove(path)
 
 
+def _clean_id(value: Optional[str]) -> Optional[str]:
+    value = (value or "").strip()
+    return value[:MAX_ID_CHARS] or None
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -216,11 +171,15 @@ def _delete_rag_index_files(document_id: str) -> None:
 async def upload_document(
     request: Request,
     file: UploadFile,
+    session_id: Optional[str] = Form(None),
+    thread_id: Optional[str] = Form(None),
     user_id: str = Depends(get_current_user),
 ):
     """
-    Uploads a PDF, extracts and chunks its text, and builds a RAG index
-    for it under an isolated document:{document_id} namespace.
+    Uploads a PDF, extracts and chunks its text, builds a RAG index for it
+    under an isolated document:{document_id} namespace, and records it
+    against the caller's chat session and/or Deep Search thread so the
+    session's document list survives a refresh.
 
     Validation runs in the exact order specified in §D.1:
         1. Content-Length size check
@@ -229,6 +188,16 @@ async def upload_document(
         4. Chunk + embed into an isolated namespace
         5. Store the file under UPLOAD_DIR, encrypted at rest
     """
+    session_id = _clean_id(session_id)
+    thread_id = _clean_id(thread_id)
+    if not session_id and not thread_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="session_id or thread_id is required.",
+        )
+    if thread_id:
+        await require_owned_thread(thread_id, user_id)
+
     # --- 1. Size check ---
     content_length = request.headers.get("content-length")
     if content_length is not None and int(content_length) > UPLOAD_MAX_SIZE_BYTES:
@@ -280,8 +249,8 @@ async def upload_document(
 
     # Extracted text is arbitrary user input -- more untrusted than an
     # arXiv PDF the pipeline itself fetched. Sanitize every chunk before
-    # it is embedded, since embedded text later flows into rag_chat()
-    # prompts via query() results.
+    # it is embedded, since embedded text later flows into chat prompts via
+    # query() results.
     chunks = [sanitize_for_prompt(c) for c in _chunk_text(full_text)]
     chunks = [c for c in chunks if c]  # drop any chunk that sanitized to empty
 
@@ -292,111 +261,86 @@ async def upload_document(
             detail="No usable text content remained after sanitization.",
         )
 
-    # --- 4. Chunk + embed into isolated namespace ---
-    build_index(chunks, namespace=_document_namespace(document_id))
-
-    # --- 5. Store the file under UPLOAD_DIR, encrypted at rest ---
-    # file_bytes (the original plaintext upload) is encrypted and written
-    # to final_path. temp_path (plaintext, used only for pypdf parsing
-    # above) is removed rather than renamed, since it must never persist
-    # on disk unencrypted.
+    # --- 4 + 5. Index, encrypt to disk, record. If any later step fails,
+    # everything already created is removed so no orphaned index/file is
+    # left behind with no database row pointing at it. ---
     title = file.filename or f"document-{document_id}.pdf"
     final_path = os.path.join(UPLOAD_DIR, f"{document_id}.pdf")
-    encrypted_bytes = encrypt_bytes(file_bytes)
-    with open(final_path, "wb") as f:
-        f.write(encrypted_bytes)
-    os.remove(temp_path)
-
-    conn = _get_db()
     try:
-        conn.execute(
-            "INSERT INTO documents (document_id, user_id, title, n_pages, file_path, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (document_id, user_id, title, n_pages, final_path, _now_iso()),
+        build_index(chunks, namespace=document_namespace(document_id))
+        # file_bytes (the original plaintext upload) is encrypted and written
+        # to final_path. temp_path (plaintext, used only for pypdf parsing
+        # above) is removed rather than renamed, since it must never persist
+        # on disk unencrypted.
+        with open(final_path, "wb") as f:
+            f.write(encrypt_bytes(file_bytes))
+        await documents_store.create_document(
+            document_id=document_id,
+            user_id=user_id,
+            title=title,
+            n_pages=n_pages,
+            file_path=final_path,
+            thread_id=thread_id,
+            session_id=session_id,
         )
-        conn.commit()
+    except Exception:
+        logger.exception("Upload failed after indexing; removing partial artifacts for %s", document_id)
+        _delete_rag_index_files(document_id)
+        if os.path.exists(final_path):
+            os.remove(final_path)
+        raise
     finally:
-        conn.close()
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
     return {"document_id": document_id, "title": title, "n_pages": n_pages}
 
 
-@router.post("/{document_id}/chat")
-async def chat_with_document(
-    document_id: str,
-    body: dict,
+@router.get("")
+async def list_session_documents(
+    session_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
     user_id: str = Depends(get_current_user),
 ):
-    """
-    Chats with a single uploaded document, grounded via rag_chat() over
-    that document's isolated namespace. Owner-only.
-    """
-    _get_owned_document_or_404(document_id, user_id)
-
-    message = body.get("message")
-    if not message or not isinstance(message, str):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="'message' is required and must be a string.",
-        )
-
-    if len(message) > _MAX_MESSAGE_LENGTH:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Message exceeds the {_MAX_MESSAGE_LENGTH} character limit.",
-        )
-
-    # Sanitize the user's message before it reaches any prompt, per D.3/B.4.
-    safe_message = sanitize_for_prompt(message)
-
-    namespace = _document_namespace(document_id)
-    answer = rag_chat(namespace, safe_message)
-
-    message_id = str(uuid.uuid4())
-    timestamp = _now_iso()
-
-    conn = _get_db()
-    try:
-        conn.execute(
-            "INSERT INTO document_chat_history (message_id, document_id, role, content, timestamp) "
-            "VALUES (?, ?, 'user', ?, ?)",
-            (str(uuid.uuid4()), document_id, safe_message, timestamp),
-        )
-        conn.execute(
-            "INSERT INTO document_chat_history (message_id, document_id, role, content, timestamp) "
-            "VALUES (?, ?, 'assistant', ?, ?)",
-            (message_id, document_id, answer, timestamp),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    # Sources are page-level per §D.1's response shape ({"sources": [{"page": 4}]}),
-    # but rag/chat.py's frozen query()/rag_chat() interface does not track
-    # page numbers per chunk -- only text + score. Returning an empty list
-    # here rather than fabricating page numbers we don't actually have.
-    return {"message_id": message_id, "answer": answer, "sources": []}
+    """The caller's documents in the given chat session and/or Deep Search
+    thread (never the whole library), oldest first. created_at lets the client
+    tell which documents were uploaded after the last message was sent."""
+    documents = await documents_store.list_documents(
+        user_id, session_id=_clean_id(session_id), thread_id=_clean_id(thread_id)
+    )
+    return [
+        {"document_id": d.document_id, "title": d.title, "n_pages": d.n_pages, "created_at": d.created_at.isoformat()}
+        for d in documents
+    ]
 
 
-@router.get("/{document_id}/chat/history")
-async def get_document_chat_history(
+@router.get("/{document_id}/file")
+async def get_document_file(
     document_id: str,
     user_id: str = Depends(get_current_user),
 ):
-    """Returns this document's chat history, oldest first. Owner-only."""
-    _get_owned_document_or_404(document_id, user_id)
+    """
+    Returns the original PDF, decrypted on the fly. Owner-only (404 for
+    anyone else). Files are encrypted at rest and there is deliberately no
+    static URL for them -- the frontend fetches this with its auth header
+    and opens the result as a blob.
+    """
+    document = await get_owned_document_or_404(document_id, user_id)
 
-    conn = _get_db()
     try:
-        rows = conn.execute(
-            "SELECT message_id, role, content, timestamp FROM document_chat_history "
-            "WHERE document_id = ? ORDER BY timestamp ASC",
-            (document_id,),
-        ).fetchall()
-    finally:
-        conn.close()
+        with open(document.file_path, "rb") as f:
+            encrypted_bytes = f.read()
+        pdf_bytes = decrypt_bytes(encrypted_bytes)
+    except (OSError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Document file is unavailable."
+        )
 
-    return [dict(row) for row in rows]
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline", "Cache-Control": "private, no-store"},
+    )
 
 
 @router.delete("/{document_id}")
@@ -405,28 +349,18 @@ async def delete_document(
     user_id: str = Depends(get_current_user),
 ):
     """
-    Deletes a document: its DB row, its chat history, its file on disk,
-    and its RAG index files. Owner-only. Per D.4 checklist: deletion must
-    actually remove both the file and its RAG index, not just the DB row.
+    Deletes a document: its database row, its file on disk, and its RAG
+    index files. Owner-only. Chat messages that referenced it are kept (the
+    conversation stays; only the link to the document is cleared). Per D.4
+    checklist: deletion must actually remove both the file and its RAG
+    index, not just the database row.
     """
-    row = _get_owned_document_or_404(document_id, user_id)
+    document = await get_owned_document_or_404(document_id, user_id)
 
-    # Remove the stored file.
-    if os.path.exists(row["file_path"]):
-        os.remove(row["file_path"])
+    await documents_store.delete_document(document_id)
 
-    # Remove the RAG index files for this namespace.
+    if os.path.exists(document.file_path):
+        os.remove(document.file_path)
     _delete_rag_index_files(document_id)
-
-    # Remove DB records (history first, to respect the foreign key).
-    conn = _get_db()
-    try:
-        conn.execute(
-            "DELETE FROM document_chat_history WHERE document_id = ?", (document_id,)
-        )
-        conn.execute("DELETE FROM documents WHERE document_id = ?", (document_id,))
-        conn.commit()
-    finally:
-        conn.close()
 
     return {"deleted": True}

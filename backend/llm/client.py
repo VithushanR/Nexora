@@ -196,3 +196,59 @@ async def llm_json_call(system_prompt: str, user_prompt: str, *,
             await asyncio.sleep(1)
 
     return None
+
+async def llm_web_search_call(question: str, *, max_output_tokens: int = 1024) -> Optional[dict]:
+    """
+    One Gemini call grounded by live Google Search (the `google_search`
+    tool). Deliberately its own call, separate from llm_json_call: Gemini
+    does not allow combining the google_search tool with a JSON response
+    mime type (or with other function-calling tools), so this returns plain
+    text and never mixes tools.
+
+    Returns:
+      - {"text": str, "sources": [{"url": str, "title": str}, ...]} on success
+      - None if the call raised a non-quota error
+      - {"_budget_exhausted": True} on quota errors (same cooldown as
+        llm_json_call)
+      - {"_blocked_or_empty": True, "finish_reason": ...} on an empty response
+    """
+    if _is_budget_exhausted():
+        return {"_budget_exhausted": True}
+
+    config = genai_types.GenerateContentConfig(
+        tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+        max_output_tokens=max_output_tokens,
+        safety_settings=SAFETY_SETTINGS,
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            _get_client().models.generate_content,
+            model=GEMINI_MODEL,
+            contents=question,
+            config=config,
+        )
+    except Exception as e:
+        msg = str(e)
+        if any(tok in msg for tok in ("RESOURCE_EXHAUSTED", "429", "402")) or "quota" in msg.lower():
+            logger.error("LLM budget/quota exhausted (web search): %s", msg[:200])
+            _trip_budget_exhausted()
+            return {"_budget_exhausted": True}
+        logger.error("Web search LLM call raised an exception: %s", msg[:300])
+        return None
+
+    candidate = response.candidates[0] if response.candidates else None
+    text = (response.text or "").strip()
+    if not text:
+        return {"_blocked_or_empty": True, "finish_reason": str(candidate.finish_reason if candidate else None)}
+
+    sources: list[dict] = []
+    seen: set[str] = set()
+    metadata = candidate.grounding_metadata if candidate else None
+    for chunk in (metadata.grounding_chunks or []) if metadata else []:
+        web = chunk.web
+        if web and web.uri and web.uri not in seen:
+            seen.add(web.uri)
+            sources.append({"url": web.uri, "title": web.title or web.uri})
+
+    return {"text": text, "sources": sources}

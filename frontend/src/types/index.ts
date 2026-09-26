@@ -99,77 +99,55 @@ export interface Gap {
 }
 
 // ---------------------------------------------------------------------------
-// Report Copilot (backend/routers/copilot.py) -- matches its response
-// models exactly (ChatResponse, HistoryEntry, IndexResponse,
-// AddToEvidenceResponse).
+// Report indexing (backend/routers/copilot.py) -- chatting over an indexed
+// report goes through the merged chat router below, not a copilot endpoint.
 // ---------------------------------------------------------------------------
-
-export type CopilotChatMode = "report" | "auto";
-export type CopilotAnswerMode = "report" | "web";
-
-export interface CopilotEvidenceSource {
-  type: "evidence_row";
-  paper_title: string;
-}
-
-export interface CopilotWebSource {
-  type: "web";
-  url: string;
-  title: string;
-}
-
-export type CopilotSource = CopilotEvidenceSource | CopilotWebSource;
-
-export interface CopilotChatResponse {
-  message_id: string;
-  answer: string;
-  mode: CopilotAnswerMode;
-  sources: CopilotSource[];
-}
-
-export interface CopilotHistoryEntry {
-  message_id: string;
-  role: "user" | "assistant";
-  content: string;
-  mode: CopilotAnswerMode | null;
-  timestamp: string;
-}
 
 export interface CopilotIndexResponse {
   indexed: boolean;
   n_chunks: number;
 }
 
-export interface CopilotAddToEvidenceResponse {
-  added: boolean;
+// ---------------------------------------------------------------------------
+// Merged chat (backend/routers/chat.py) -- matches ChatRequest/ChatResponse/
+// ChatSource exactly. "mode" here is only chat vs web; report/document
+// grounding is automatic from what the request carries.
+// ---------------------------------------------------------------------------
+
+export type ChatRequestMode = "chat" | "web";
+export type ChatAnswerMode = "general" | "grounded" | "web";
+
+export interface ChatSource {
+  kind: "report" | "document" | "web";
+  label: string;
+  id: string | null;
+  url: string | null;
+}
+
+export interface ChatResponse {
+  message_id: string;
+  reply: string;
+  mode: ChatAnswerMode;
+  sources: ChatSource[];
+}
+
+export interface ChatHistoryMessage {
+  message_id: string;
+  role: "user" | "assistant";
+  content: string;
+  mode: ChatAnswerMode | null;
+  sources: ChatSource[];
+  created_at: string;
 }
 
 // ---------------------------------------------------------------------------
-// Document upload + single-paper chat (backend/routers/documents.py) --
-// matches its response shapes exactly. Note this has no "mode" concept
-// (unlike Copilot) and its chat sources are page-level, not
-// evidence_row/web-typed.
+// Document upload (backend/routers/documents.py).
 // ---------------------------------------------------------------------------
 
 export interface DocumentUploadResponse {
   document_id: string;
   title: string;
   n_pages: number;
-}
-
-export interface DocumentChatSource {
-  page: number;
-}
-
-export interface DocumentChatResponse {
-  message_id: string;
-  answer: string;
-  sources: DocumentChatSource[];
-}
-
-export interface DocumentChatHistoryEntry {
-  message_id: string;
-  role: "user" | "assistant";
-  content: string;
-  timestamp: string;
+  /** Present on documents listed from the server (not on a fresh upload response). */
+  created_at?: string;
 }

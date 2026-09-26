@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import GoogleSignInButton from "../auth/GoogleSignInButton";
+import { NEW_SESSION_EVENT } from "../chatSession";
 
 interface HistoryEntry {
   threadId: string;
@@ -98,7 +99,10 @@ export default function Sidebar() {
       {/* New search button */}
       <div className="px-4 pb-5">
         <button
-          onClick={() => navigate("/")}
+          onClick={() => {
+            window.dispatchEvent(new Event(NEW_SESSION_EVENT));
+            navigate("/");
+          }}
           className="flex w-full items-center justify-center gap-2 rounded-xl bg-violet-600 px-4 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-violet-500 active:scale-[0.98]"
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
@@ -185,20 +189,6 @@ export default function Sidebar() {
           </div>
         )}
 
-        <Link
-          to="/upload"
-          className={`mb-0.5 flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition ${
-            location.pathname === "/upload"
-              ? "border-l-[3px] border-violet-500 bg-violet-50 pl-[9px] text-slate-900 dark:bg-violet-950/40 dark:text-white"
-              : "text-slate-600 hover:bg-slate-50 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
-          }`}
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6z" />
-            <path d="M14 2v6h6" />
-          </svg>
-          Uploaded sources
-        </Link>
       </nav>
 
       {/* CURRENT PROJECT */}

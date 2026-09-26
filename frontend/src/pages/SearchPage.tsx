@@ -14,20 +14,27 @@ import {
   startResearch,
   submitSelection,
   uploadDocument,
-  sendDocumentChat,
-  sendGeneralChat,
-  sendCopilotMessage,
+  deleteDocument,
+  getChatHistory,
+  listDocuments,
+  sendChat,
   indexCopilot,
 } from "../api/client";
+import { NEW_SESSION_EVENT, createSessionId, getOrCreateSessionId, storeSessionId } from "../chatSession";
 import { useAuth } from "../auth/AuthContext";
 import GoogleSignInButton from "../auth/GoogleSignInButton";
 import { addHistory, getHistory } from "../components/Sidebar";
 import CardShell from "../components/CardShell";
 import CandidateSelectionModal from "../components/CandidateSelectionModal";
 import ReportView from "../components/ReportView";
-import type { CandidatePaper, DocumentUploadResponse, ResearchStatus } from "../types";
+import ChatSourceChips from "../components/ChatSourceChips";
+import SessionDocumentsMenu from "../components/SessionDocumentsMenu";
+import type { CandidatePaper, ChatHistoryMessage, ChatSource, DocumentUploadResponse, ResearchStatus } from "../types";
 
-type Mode = "chat" | "deep-search";
+// Three modes: Chat (general, or grounded automatically on this thread's
+// finished report and/or attached documents), Web Search (always live web,
+// never overridden by thread context), and Deep Search (the paper pipeline).
+type Mode = "chat" | "web" | "deep-search";
 
 // Item 4/5/7: the whole Deep Search lifecycle now lives in this one page,
 // as one continuous chat thread -- no navigation to a separate selection
@@ -38,8 +45,10 @@ interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
-  pages?: number[];
-  document?: DocumentUploadResponse;
+  /** Where an assistant answer came from (report / documents / web pages). */
+  sources?: ChatSource[];
+  /** Documents that were attached when this user message was sent. */
+  documents?: DocumentUploadResponse[];
   /** When set, this message renders as a ReportView card instead of plain/markdown text (item 7). */
   reportThreadId?: string;
   reportText?: string;
@@ -71,6 +80,30 @@ let messageIdCounter = 0;
 function nextMessageId(prefix: string): string {
   messageIdCounter += 1;
   return `${prefix}-${Date.now()}-${messageIdCounter}`;
+}
+
+// After a refresh the page has no memory of what was sent. A document counts as
+// already sent if any stored user message is newer than its upload -- every
+// Chat-mode message goes out with all of the session's documents attached.
+function sentDocumentIdsFromHistory(documents: DocumentUploadResponse[], history: ChatHistoryMessage[]): Set<string> {
+  const userMessageTimes = history.filter((entry) => entry.role === "user").map((entry) => Date.parse(entry.created_at));
+  const sent = new Set<string>();
+  for (const document of documents) {
+    const uploadedAt = document.created_at ? Date.parse(document.created_at) : NaN;
+    if (!Number.isNaN(uploadedAt) && userMessageTimes.some((sentAt) => sentAt > uploadedAt)) {
+      sent.add(document.document_id);
+    }
+  }
+  return sent;
+}
+
+function messageFromHistory(entry: ChatHistoryMessage): Message {
+  return {
+    id: entry.message_id,
+    role: entry.role,
+    content: entry.content,
+    sources: entry.role === "assistant" ? entry.sources : undefined,
+  };
 }
 
 // Issue 3: sessionStorage-backed draft so a composer-in-progress survives
@@ -188,8 +221,19 @@ export default function SearchPage() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [needsSignIn, setNeedsSignIn] = useState(false);
 
-  const [doc, setDoc] = useState<DocumentUploadResponse | null>(null);
+  // The chat session this page belongs to (see chatSession.ts). Messages and
+  // uploads are stored under it, so a refresh reloads them from the server.
+  const [sessionId, setSessionId] = useState(getOrCreateSessionId);
+
+  // Documents uploaded in THIS session only -- shown in the folder panel and
+  // used to ground Chat-mode answers. Restored from the server on load.
+  const [documents, setDocuments] = useState<DocumentUploadResponse[]>([]);
+  // Documents already sent with a chat message: those chips are done, only
+  // documents attached since the last message show as "attached to this chat".
+  const [sentDocumentIds, setSentDocumentIds] = useState<Set<string>>(new Set());
   const [uploading, setUploading] = useState(false);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const dragDepthRef = useRef(0);
 
   // Deep Search thread state -- item 4/5/7: all one persistent thread.
   const [threadId, setThreadId] = useState<string | null>(null);
@@ -217,6 +261,58 @@ export default function SearchPage() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isThinking]);
+
+  // Restore this session's documents and conversation from the server. Inside
+  // a resumed Deep Search thread the messages are appended after its report
+  // is shown -- see the resume effect below -- but the history is still what
+  // tells us which documents were already sent.
+  useEffect(() => {
+    if (status !== "signed-in") return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const restoredDocuments = await listDocuments({ sessionId, threadId: routeThreadId });
+        const history = await getChatHistory({ sessionId, threadId: routeThreadId });
+        if (cancelled) return;
+        setDocuments(restoredDocuments);
+        setSentDocumentIds(sentDocumentIdsFromHistory(restoredDocuments, history));
+        if (!routeThreadId && history.length > 0) {
+          setMessages((current) => (current.length === 0 ? history.map(messageFromHistory) : current));
+        }
+      } catch (error) {
+        if (!cancelled && error instanceof ApiClientError && error.status === 401) handleUnauthorized();
+        // Anything else: the page still works, it just starts empty.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, sessionId, routeThreadId]);
+
+  // "New search": a brand-new session -- fresh id, empty thread, no documents.
+  useEffect(() => {
+    function startNewSession() {
+      window.clearTimeout(pollTimeoutRef.current);
+      const freshId = createSessionId();
+      storeSessionId(freshId);
+      setSessionId(freshId);
+      setMessages([]);
+      setDocuments([]);
+      setSentDocumentIds(new Set());
+      setThreadId(null);
+      setDeepSearchStage("idle");
+      setCandidates([]);
+      setSelectedIndices([]);
+      setIsSelectionModalOpen(false);
+      setIsThinking(false);
+      setProgressMessage("");
+      setErrorMessage(null);
+      setInput("");
+    }
+    window.addEventListener(NEW_SESSION_EVENT, startNewSession);
+    return () => window.removeEventListener(NEW_SESSION_EVENT, startNewSession);
+  }, []);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -308,13 +404,11 @@ export default function SearchPage() {
             ...m,
             { id: nextMessageId("a"), role: "assistant", content: "", reportThreadId: id, reportText: reportResponse.report },
           ]);
-          // Issue 11c: index the finished report for Report Copilot chat as
-          // soon as it's available, so Chat mode has something real to
-          // ground answers in the moment the thread reaches "done" --
-          // not only once the user happens to ask a question. Best-effort:
-          // /copilot/chat degrades gracefully (empty retrieval, not an
-          // error) if this hasn't finished yet, so a failure here is logged
-          // and swallowed rather than surfaced as a research error.
+          // Index the finished report as soon as it's available, so Chat mode
+          // can ground on it the moment the thread reaches "done". Best-
+          // effort: chat degrades gracefully (no report hits, not an error)
+          // if this hasn't finished yet, so a failure here is logged and
+          // swallowed rather than surfaced as a research error.
           indexCopilot(id).catch((error) => {
             console.error("Report Copilot indexing failed for thread", id, error);
           });
@@ -367,7 +461,20 @@ export default function SearchPage() {
         content: domain ?? "Continuing this research thread…",
       },
     ]);
-    void pollThread(routeThreadId);
+    void (async () => {
+      await pollThread(routeThreadId);
+      try {
+        const history = await getChatHistory({ sessionId, threadId: routeThreadId });
+        if (history.length > 0 && pollActiveRef.current) {
+          setMessages((current) => {
+            const known = new Set(current.map((message) => message.id));
+            return [...current, ...history.filter((entry) => !known.has(entry.message_id)).map(messageFromHistory)];
+          });
+        }
+      } catch {
+        // History is a nicety on resume; the report itself already rendered.
+      }
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [routeThreadId]);
 
@@ -383,8 +490,8 @@ export default function SearchPage() {
     setUploading(true);
     setErrorMessage(null);
     try {
-      const result = await uploadDocument(file);
-      setDoc(result);
+      const result = await uploadDocument(file, { sessionId, threadId });
+      setDocuments((current) => [...current, result]);
     } catch (e) {
       if (e instanceof ApiClientError && e.status === 401) {
         handleUnauthorized();
@@ -394,6 +501,25 @@ export default function SearchPage() {
     } finally {
       setUploading(false);
     }
+  }
+
+  async function handleFiles(files: FileList | File[]) {
+    for (const file of Array.from(files)) {
+      await handleFileUpload(file);
+    }
+  }
+
+  async function removeDocument(document: DocumentUploadResponse) {
+    try {
+      await deleteDocument(document.document_id);
+      setDocuments((current) => current.filter((d) => d.document_id !== document.document_id));
+    } catch (e) {
+      setErrorMessage(e instanceof ApiError ? e.message : "The document could not be removed.");
+    }
+  }
+
+  function hasFiles(event: React.DragEvent): boolean {
+    return Array.from(event.dataTransfer.types).includes("Files");
   }
 
   function updateCandidateSelection(index: number, selected: boolean): void {
@@ -439,10 +565,9 @@ export default function SearchPage() {
     if (!trimmed || isThinking) return;
 
     setErrorMessage(null);
-    const pendingDocument =
-      doc && !messages.some((message) => message.document?.document_id === doc.document_id)
-        ? doc
-        : undefined;
+    // Documents attached since the last chat message -- shown once, on the
+    // message that first sends them.
+    const pendingDocuments = documents.filter((d) => !sentDocumentIds.has(d.document_id));
 
     if (mode === "deep-search") {
       if (status !== "signed-in") {
@@ -452,10 +577,7 @@ export default function SearchPage() {
       }
       setNeedsSignIn(false);
 
-      setMessages((m) => [
-        ...m,
-        { id: nextMessageId("u"), role: "user", content: trimmed, document: pendingDocument },
-      ]);
+      setMessages((m) => [...m, { id: nextMessageId("u"), role: "user", content: trimmed }]);
       setInput("");
       setIsThinking(true);
       setProgressMessage("Starting research…");
@@ -485,45 +607,43 @@ export default function SearchPage() {
         setDeepSearchStage("error");
       }
     } else {
-      // Issue 11c: a completed Deep Search report in THIS thread takes
-      // priority over an uploaded document, which takes priority over
-      // plain conversational chat -- checked in that order every send, not
-      // just decided once, so it stays correct if e.g. a report finishes
-      // mid-conversation.
-      const hasReport = deepSearchStage === "done" && threadId !== null;
+      // One endpoint for Chat and Web Search. The backend decides how to
+      // answer: web mode always searches the web; chat mode grounds on this
+      // thread's finished report and/or the attached documents when there
+      // are any (both at once, cited separately), else replies
+      // conversationally. The client just says which mode and what's attached.
+      const reportThreadId = deepSearchStage === "done" ? threadId : null;
+      const documentIds = documents.map((d) => d.document_id);
+      const isGrounded = mode === "chat" && (reportThreadId !== null || documentIds.length > 0);
 
       setMessages((m) => [
         ...m,
-        { id: nextMessageId("u"), role: "user", content: trimmed, document: pendingDocument },
+        {
+          id: nextMessageId("u"),
+          role: "user",
+          content: trimmed,
+          documents: mode === "chat" && pendingDocuments.length > 0 ? pendingDocuments : undefined,
+        },
       ]);
       setInput("");
+      if (mode === "chat" && documentIds.length > 0) {
+        setSentDocumentIds((current) => new Set([...current, ...documentIds]));
+      }
       setIsThinking(true);
-      // Mode-specific progress text, set BEFORE isThinking is read by the
-      // render -- item 1's bug was this being left blank here (for every
-      // chat sub-mode) and the thinking indicator falling back to a
-      // hardcoded "Searching the document…" regardless of whether a
-      // document, a report, or neither was actually in play.
-      setProgressMessage(hasReport ? "Searching the report…" : doc ? "Searching the document…" : "Thinking…");
+      setProgressMessage(mode === "web" ? "Searching the web…" : isGrounded ? "Searching your sources…" : "Thinking…");
 
       try {
-        if (hasReport) {
-          const res = await sendCopilotMessage(threadId as string, trimmed, "report");
-          setMessages((m) => [...m, { id: res.message_id, role: "assistant", content: res.answer }]);
-        } else if (doc) {
-          const res = await sendDocumentChat(doc.document_id, trimmed);
-          setMessages((m) => [
-            ...m,
-            {
-              id: res.message_id,
-              role: "assistant",
-              content: res.answer,
-              pages: res.sources?.map((s) => s.page),
-            },
-          ]);
-        } else {
-          const res = await sendGeneralChat(trimmed);
-          setMessages((m) => [...m, { id: nextMessageId("a"), role: "assistant", content: res.reply }]);
-        }
+        const res = await sendChat({
+          message: trimmed,
+          mode,
+          sessionId,
+          threadId: reportThreadId,
+          documentIds,
+        });
+        setMessages((m) => [
+          ...m,
+          { id: res.message_id, role: "assistant", content: res.reply, sources: res.sources },
+        ]);
       } catch (e) {
         if (e instanceof ApiClientError && e.status === 401) {
           handleUnauthorized();
@@ -549,7 +669,9 @@ export default function SearchPage() {
   const footerClassName =
     mode === "deep-search"
       ? "border-violet-300 bg-violet-50/40 focus-within:ring-1 focus-within:ring-violet-200 dark:border-violet-700 dark:bg-violet-950/20 dark:focus-within:ring-violet-800"
-      : "border-slate-200 bg-white focus-within:border-violet-300 focus-within:ring-1 focus-within:ring-violet-100 dark:border-slate-700 dark:bg-slate-800 dark:focus-within:border-violet-700 dark:focus-within:ring-violet-900/30";
+      : mode === "web"
+        ? "border-emerald-300 bg-emerald-50/40 focus-within:ring-1 focus-within:ring-emerald-200 dark:border-emerald-700 dark:bg-emerald-950/20 dark:focus-within:ring-emerald-800"
+        : "border-slate-200 bg-white focus-within:border-violet-300 focus-within:ring-1 focus-within:ring-violet-100 dark:border-slate-700 dark:bg-slate-800 dark:focus-within:border-violet-700 dark:focus-within:ring-violet-900/30";
 
   const inputBar = (
     <div className="px-3 pb-2 pt-2">
@@ -557,25 +679,29 @@ export default function SearchPage() {
           itself already spans the card's width) was what created the empty
           side gutters. Content now fills the box's actual width. */}
       <div>
-        {/* Uploaded doc chip */}
-        {doc && !messages.some((message) => message.document?.document_id === doc.document_id) && (
-          <div className="mb-2 flex items-center gap-2 rounded-xl bg-violet-50 px-3 py-2 dark:bg-violet-950/30">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" className="shrink-0 text-violet-500">
-              <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
-              <path d="M14 2v6h6" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
-            </svg>
-            <span className="flex-1 truncate text-xs font-medium text-slate-700 dark:text-slate-300">{doc.title}</span>
-            <span className="shrink-0 text-[10px] text-slate-400">{doc.n_pages} pages</span>
-            <button
-              onClick={() => setDoc(null)}
-              className="ml-1 rounded p-0.5 text-slate-400 transition hover:bg-violet-100 hover:text-slate-600 dark:hover:bg-violet-900/40 dark:hover:text-slate-300"
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-                <path d="M18 6L6 18M6 6l12 12" />
+        {/* Attached documents not yet sent with a message */}
+        {documents
+          .filter((d) => !sentDocumentIds.has(d.document_id))
+          .map((d) => (
+            <div key={d.document_id} className="mb-2 flex items-center gap-2 rounded-xl bg-violet-50 px-3 py-2 dark:bg-violet-950/30">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" className="shrink-0 text-violet-500">
+                <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+                <path d="M14 2v6h6" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
               </svg>
-            </button>
-          </div>
-        )}
+              <span className="flex-1 truncate text-xs font-medium text-slate-700 dark:text-slate-300">{d.title}</span>
+              <span className="shrink-0 text-[10px] text-slate-400">{d.n_pages} {d.n_pages === 1 ? "page" : "pages"} &middot; attached to this chat</span>
+              <button
+                onClick={() => void removeDocument(d)}
+                title="Remove document"
+                aria-label={`Remove ${d.title}`}
+                className="ml-1 rounded p-0.5 text-slate-400 transition hover:bg-violet-100 hover:text-slate-600 dark:hover:bg-violet-900/40 dark:hover:text-slate-300"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                  <path d="M18 6L6 18M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+          ))}
 
         {/* Uploading indicator */}
         {uploading && (
@@ -603,7 +729,7 @@ export default function SearchPage() {
           <button
             onClick={() => fileRef.current?.click()}
             disabled={uploading}
-            title="Upload document"
+            title="Attach a PDF"
             className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-violet-50 hover:text-violet-600 disabled:opacity-40 dark:hover:bg-violet-900/30 dark:hover:text-violet-400"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
@@ -620,7 +746,13 @@ export default function SearchPage() {
                 handleSubmit();
               }
             }}
-            placeholder={deepSearchStage === "running_synthesis" ? "Analyzing selected papers…" : "Message Nexora…"}
+            placeholder={
+              deepSearchStage === "running_synthesis"
+                ? "Analyzing selected papers…"
+                : mode === "web"
+                  ? "Search the web…"
+                  : "Message Nexora…"
+            }
             rows={1}
             disabled={inputDisabled}
             className="block min-h-[24px] flex-1 resize-none bg-transparent text-[14px] leading-6 text-slate-800 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed dark:text-slate-200 dark:placeholder:text-slate-500"
@@ -640,6 +772,22 @@ export default function SearchPage() {
             >
               <Sparkle size={11} />
               Chat
+            </button>
+            <button
+              onClick={() => setMode("web")}
+              disabled={inputDisabled}
+              title="Web Search"
+              className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium transition ${
+                mode === "web"
+                  ? "bg-violet-100 text-violet-700 dark:bg-violet-900/50 dark:text-violet-300"
+                  : "text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200"
+              }`}
+            >
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18" />
+              </svg>
+              Web Search
             </button>
             <button
               onClick={() => setMode("deep-search")}
@@ -680,7 +828,7 @@ export default function SearchPage() {
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12" />
             </svg>
-            Drop PDFs, docs, or links here
+            Drop a PDF here or click + to attach
           </button>
           <span className="text-[11px] text-slate-400 dark:text-slate-500">
             Enter to send · Shift + Enter for newline
@@ -691,6 +839,39 @@ export default function SearchPage() {
   );
 
   return (
+    <div
+      className="relative h-full"
+      onDragEnter={(event) => {
+        if (!hasFiles(event)) return;
+        event.preventDefault();
+        dragDepthRef.current += 1;
+        setIsDraggingFile(true);
+      }}
+      onDragOver={(event) => {
+        if (hasFiles(event)) event.preventDefault();
+      }}
+      onDragLeave={(event) => {
+        if (!hasFiles(event)) return;
+        dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+        if (dragDepthRef.current === 0) setIsDraggingFile(false);
+      }}
+      onDrop={(event) => {
+        if (!hasFiles(event)) return;
+        event.preventDefault();
+        dragDepthRef.current = 0;
+        setIsDraggingFile(false);
+        void handleFiles(event.dataTransfer.files);
+      }}
+    >
+    <SessionDocumentsMenu
+      documents={documents}
+      onRemoved={(documentId) => setDocuments((current) => current.filter((d) => d.document_id !== documentId))}
+    />
+    {isDraggingFile && (
+      <div className="pointer-events-none absolute inset-3 z-40 flex items-center justify-center rounded-3xl border-2 border-dashed border-violet-400 bg-violet-50/80 text-sm font-medium text-violet-700 backdrop-blur-sm dark:border-violet-500 dark:bg-violet-950/70 dark:text-violet-300 sm:inset-6 lg:inset-8">
+        Drop a PDF to attach it to this chat
+      </div>
+    )}
     <CardShell footer={inputBar} footerClassName={footerClassName}>
       {/* Messages / empty state */}
       <div className="relative flex-1 overflow-y-auto">
@@ -732,18 +913,18 @@ export default function SearchPage() {
               <div key={m.id} className="py-3">
                 {m.role === "user" ? (
                   <div className="flex flex-col items-end gap-2">
-                    {m.document && (
-                      <div className="flex w-[365px] max-w-[80%] items-center gap-2 rounded-xl bg-violet-50 px-3 py-2 dark:bg-violet-950/30">
+                    {m.documents?.map((d) => (
+                      <div key={d.document_id} className="flex w-[365px] max-w-[80%] items-center gap-2 rounded-xl bg-violet-50 px-3 py-2 dark:bg-violet-950/30">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" className="shrink-0 text-violet-500">
                           <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
                           <path d="M14 2v6h6" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
                         </svg>
                         <span className="min-w-0 flex-1 truncate text-left text-xs font-medium text-slate-700 dark:text-slate-300">
-                          {m.document.title}
+                          {d.title}
                         </span>
-                        <span className="shrink-0 text-[10px] text-slate-400">{m.document.n_pages} pages</span>
+                        <span className="shrink-0 text-[10px] text-slate-400">{d.n_pages} {d.n_pages === 1 ? "page" : "pages"}</span>
                       </div>
-                    )}
+                    ))}
                     <div className="max-w-[80%] rounded-2xl bg-slate-100 px-4 py-3 text-[15px] leading-relaxed text-slate-800 dark:bg-slate-800 dark:text-slate-200">
                       {m.content}
                     </div>
@@ -768,11 +949,7 @@ export default function SearchPage() {
                       <ReactMarkdown remarkPlugins={[remarkGfm]} components={CHAT_MD}>
                         {m.content}
                       </ReactMarkdown>
-                      {m.pages && m.pages.length > 0 && (
-                        <p className="mt-2 text-xs text-slate-400">
-                          Pages: {m.pages.join(", ")}
-                        </p>
-                      )}
+                      {m.sources && <ChatSourceChips sources={m.sources} />}
                       {m.showReviewPapersButton && deepSearchStage === "paused_for_selection" && !isSelectionModalOpen && (
                         <button
                           onClick={() => setIsSelectionModalOpen(true)}
@@ -832,13 +1009,14 @@ export default function SearchPage() {
         ref={fileRef}
         type="file"
         accept=".pdf"
+        multiple
         className="hidden"
         onChange={(e) => {
-          const file = e.target.files?.[0];
-          if (file) handleFileUpload(file);
+          if (e.target.files) void handleFiles(e.target.files);
           e.target.value = "";
         }}
       />
     </CardShell>
+    </div>
   );
 }

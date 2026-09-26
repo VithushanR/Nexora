@@ -19,27 +19,21 @@ NOTE: the first test run will download the embedding model
 one-time cost per machine.
 """
 
-import os
-import shutil
-
 import pytest
 
 import rag.chat as rag_chat_module
-from rag.chat import build_index, query, rag_chat, _INDEX_STORE_DIR
+from rag.chat import build_index, query, rag_chat
 
 
 @pytest.fixture(autouse=True)
-def clean_index_store():
+def clean_index_store(tmp_path, monkeypatch):
     """
-    Each test gets a clean index_store directory so tests can't leak
-    state into each other via leftover .faiss/.pkl files on disk.
+    Each test gets its own empty index directory so tests can't leak state
+    into each other -- and never touch the real backend/rag/index_store/
+    (deleting that directory used to wipe every real index in it).
     """
-    if os.path.exists(_INDEX_STORE_DIR):
-        shutil.rmtree(_INDEX_STORE_DIR)
-    os.makedirs(_INDEX_STORE_DIR, exist_ok=True)
+    monkeypatch.setattr(rag_chat_module, "_INDEX_STORE_DIR", str(tmp_path))
     yield
-    if os.path.exists(_INDEX_STORE_DIR):
-        shutil.rmtree(_INDEX_STORE_DIR)
 
 
 class TestBuildAndQuery:

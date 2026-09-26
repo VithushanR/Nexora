@@ -7,6 +7,7 @@ Tests for Agent 2, covering the cases called out in the build reference:
 Run with: pytest backend/tests/test_retrieval_screening.py -v
 """
 
+import asyncio
 import pytest
 from typing import cast
 from unittest.mock import AsyncMock, patch
@@ -15,9 +16,11 @@ from backend.agents.retrieval_screening import (
     dedupe, prerank_and_cap, screen_candidate, sort_by_verdict,
     retrieve_all_sources, run_retrieval_and_screening,
     compute_paper_url, apply_relevance_percent,
+    retrieval_screening_node, screen_all,
 )
+from backend.tiers import TierName, get_tier_config
 from backend.sources.base import SourceUnavailableError
-from backend.graph.state import Candidate, Protocol
+from backend.graph.state import Candidate, Protocol, ResearchState
 
 
 PROTOCOL: Protocol = {
@@ -97,7 +100,7 @@ def test_cap_orders_by_prerank_score_descending():
 
 
 def test_empty_candidate_list_returns_empty():
-    assert prerank_and_cap([], PROTOCOL) == []
+    assert prerank_and_cap([], PROTOCOL, cap=50) == []
 
 
 # ------------------------------------------------------------------
@@ -310,3 +313,77 @@ async def test_run_retrieval_and_screening_end_to_end():
     assert len(result) == 5
     assert all(c.get("verdict") == "INCLUDE" for c in result)
     assert all("has_usable_abstract" in c for c in result)
+
+# ------------------------------------------------------------------
+# Tier-based limits (FREE 50/5, PRO 150/10, TEAM 300/20)
+# ------------------------------------------------------------------
+
+TIER_EXPECTATIONS = [(TierName.FREE, 50, 5), (TierName.PRO, 150, 10), (TierName.TEAM, 300, 20)]
+
+
+def _many_candidates(n: int) -> list[Candidate]:
+    return [
+        make_candidate(doi=f"10.1/{i}", title=f"Paper {i}", abstract="deep learning test domain " * 10)
+        for i in range(n)
+    ]
+
+
+@pytest.mark.parametrize("tier,cap,concurrency", TIER_EXPECTATIONS)
+def test_tier_config_matches_expected_limits(tier, cap, concurrency):
+    limits = get_tier_config(tier)
+    assert (limits.candidate_cap, limits.concurrency) == (cap, concurrency)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tier,cap,concurrency", TIER_EXPECTATIONS)
+async def test_node_caps_before_screening_and_uses_tier_concurrency(tier, cap, concurrency):
+    raw = _many_candidates(cap + 40)
+    screened_sizes: list[int] = []
+    in_flight = 0
+    peak = 0
+
+    async def fake_screen_candidate(candidate, protocol):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return {"verdict": "INCLUDE", "quote": "q", "reason": "r"}
+
+    async def spying_screen_all(candidates, protocol, concurrency):
+        screened_sizes.append(len(candidates))
+        return await screen_all(candidates, protocol, concurrency=concurrency)
+
+    state = {"tier": tier, "protocol": PROTOCOL}
+    with patch("backend.agents.retrieval_screening.retrieve_all_sources",
+               new=AsyncMock(return_value=(raw, []))),          patch("backend.agents.retrieval_screening.screen_candidate", new=fake_screen_candidate),          patch("backend.agents.retrieval_screening.screen_all", new=spying_screen_all),          patch("backend.agents.retrieval_screening.get_tier_config", wraps=get_tier_config) as spy:
+        result = await retrieval_screening_node(cast(ResearchState, state))
+
+    spy.assert_called_once_with(tier)
+    assert screened_sizes == [cap]  # capped BEFORE screening, exactly the tier cap
+    assert len(result["candidates"]) == cap
+    assert peak == concurrency  # semaphore really limits in-flight calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tier,cap,concurrency", TIER_EXPECTATIONS)
+async def test_screen_all_peak_concurrency_matches_tier(tier, cap, concurrency):
+    in_flight = 0
+    peak = 0
+
+    async def fake_screen_candidate(candidate, protocol):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return {"verdict": "INCLUDE", "quote": "q", "reason": "r"}
+
+    with patch("backend.agents.retrieval_screening.screen_candidate", new=fake_screen_candidate):
+        await screen_all(_many_candidates(concurrency * 3), PROTOCOL, concurrency=concurrency)
+    assert peak == concurrency
+
+
+@pytest.mark.parametrize("tier,cap,concurrency", TIER_EXPECTATIONS)
+def test_prerank_and_cap_enforces_tier_cap(tier, cap, concurrency):
+    assert len(prerank_and_cap(_many_candidates(cap + 25), PROTOCOL, cap=cap)) == cap
