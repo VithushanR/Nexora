@@ -1,10 +1,17 @@
 """PDF rendering checks for the downloadable Nexora research report."""
 
 from io import BytesIO
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pypdf import PdfReader
 
 from backend.agents.report_assembly import render_pdf
+from backend.auth.jwt import get_current_user
+from backend.routers import research
 
 
 def test_render_pdf_uses_branded_layout_and_real_evidence_table():
@@ -69,3 +76,91 @@ No contradictions detected.
         for annotation in (page.get("/Annots") or [])
     ]
     assert any(annotation.get("/A", {}).get("/URI") for annotation in annotations)
+
+
+# ---------------------------------------------------------------------------
+# Tier gate on GET /research/{thread_id}/report/pdf
+# ---------------------------------------------------------------------------
+
+# Fake tier limits, so these tests don't depend on the final values in
+# backend/tiers.py. NO_PDF_FIELD has no pdf_export_enabled, i.e. today's
+# behaviour: every tier can export.
+PDF_DISABLED = SimpleNamespace(pdf_export_enabled=False)
+PDF_ENABLED = SimpleNamespace(pdf_export_enabled=True)
+NO_PDF_FIELD = SimpleNamespace()
+
+
+@pytest.fixture
+def pdf_endpoint(monkeypatch):
+    """The research router with auth, tier lookup and report loading faked,
+    so no JWT, users table or LangGraph checkpoint is needed."""
+    env = SimpleNamespace(
+        tier_lookup=AsyncMock(return_value="free"),
+        load_report=AsyncMock(return_value=research.ReportResponse(report="# Report\n\nSome findings.")),
+    )
+    monkeypatch.setattr(research, "get_user_tier", env.tier_lookup)
+    monkeypatch.setattr(research, "research_report", env.load_report)
+
+    def use_limits(limits):
+        monkeypatch.setattr(research, "get_tier_config", lambda tier: limits)
+
+    env.use_limits = use_limits
+
+    app = FastAPI()
+    app.include_router(research.router)
+    app.dependency_overrides[get_current_user] = lambda: "user_alice"
+    env.client = TestClient(app)
+    return env
+
+
+def test_pdf_export_disabled_tier_gets_upgrade_error(pdf_endpoint):
+    pdf_endpoint.use_limits(PDF_DISABLED)
+
+    response = pdf_endpoint.client.get("/research/thread-1/report/pdf")
+
+    assert response.status_code == 403
+    detail = response.json()["detail"]
+    assert detail["code"] == "tier_limit"
+    assert detail["limit"] == "pdf_export_enabled"
+    assert "upgrade" in detail["message"].lower()
+    assert "Markdown report is still available" in detail["message"]
+
+
+def test_pdf_export_disabled_tier_never_loads_or_renders_the_report(pdf_endpoint, monkeypatch):
+    pdf_endpoint.use_limits(PDF_DISABLED)
+    renderer = Mock()
+    monkeypatch.setattr("backend.agents.report_assembly.render_pdf", renderer)
+
+    pdf_endpoint.client.get("/research/thread-1/report/pdf")
+
+    pdf_endpoint.load_report.assert_not_awaited()
+    renderer.assert_not_called()
+
+
+def test_pdf_export_enabled_tier_gets_the_pdf(pdf_endpoint):
+    pdf_endpoint.use_limits(PDF_ENABLED)
+
+    response = pdf_endpoint.client.get("/research/thread-1/report/pdf")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/pdf"
+    assert "thread-1" in response.headers["content-disposition"]
+    assert response.content.startswith(b"%PDF")
+    pdf_endpoint.load_report.assert_awaited_once_with("thread-1", "user_alice")
+
+
+def test_tier_without_pdf_field_keeps_current_behaviour(pdf_endpoint):
+    pdf_endpoint.use_limits(NO_PDF_FIELD)
+
+    response = pdf_endpoint.client.get("/research/thread-1/report/pdf")
+
+    assert response.status_code == 200
+    assert response.content.startswith(b"%PDF")
+
+
+def test_pdf_gate_uses_the_requesting_users_tier(pdf_endpoint):
+    pdf_endpoint.use_limits(PDF_ENABLED)
+
+    pdf_endpoint.client.get("/research/thread-1/report/pdf")
+
+    pdf_endpoint.tier_lookup.assert_awaited_once_with("user_alice")

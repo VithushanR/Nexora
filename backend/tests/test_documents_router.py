@@ -19,13 +19,16 @@ import io
 import os
 from dataclasses import replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient as _BaseTestClient
 from reportlab.pdfgen import canvas
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
+import backend.documents_store as real_documents_store
 import backend.routers.documents as documents_module
 from backend.auth.jwt import get_current_user
 from backend.documents_store import Document
@@ -69,6 +72,9 @@ class FakeDocumentsStore:
 
     async def delete_document(self, document_id):
         self.rows.pop(document_id, None)
+
+    async def count_documents(self, user_id, *, session_id=None, thread_id=None):
+        return len(await self.list_documents(user_id, session_id=session_id, thread_id=thread_id))
 
 
 # ---------------------------------------------------------------------------
@@ -527,3 +533,174 @@ class TestDeletion:
 
         response = client.get(f"/documents/{document_id}/file")
         assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Tier upload limits: per-session document cap + tier size limit
+# ---------------------------------------------------------------------------
+
+# Fake tier limits, so these tests don't depend on the final numbers in
+# backend/tiers.py. NO_TIER_UPLOAD_LIMITS has none of the upload fields,
+# i.e. today's behaviour: no document cap, only the global size limit.
+NO_TIER_UPLOAD_LIMITS = SimpleNamespace()
+FREE_UPLOAD_LIMITS = SimpleNamespace(upload_max_docs=1, upload_max_size_mb=1)
+PRO_UPLOAD_LIMITS = SimpleNamespace(upload_max_docs=20, upload_max_size_mb=20)
+
+
+def _use_upload_limits(monkeypatch, limits):
+    monkeypatch.setattr(documents_module, "get_tier_config", lambda tier: limits)
+
+
+@pytest.fixture(autouse=True)
+def default_tier(monkeypatch):
+    """No test in this file talks to the users table: every upload resolves
+    to a tier with no upload limits unless a test sets its own."""
+    monkeypatch.setattr(documents_module, "get_user_tier", AsyncMock(return_value="free"))
+    _use_upload_limits(monkeypatch, NO_TIER_UPLOAD_LIMITS)
+
+
+def _padded_pdf_bytes(size_bytes: int) -> bytes:
+    """Starts with real PDF magic bytes, padded to size_bytes -- enough to
+    reach the size checks, which run before any PDF parsing."""
+    pdf = _make_real_pdf_bytes()
+    return pdf + b"\0" * max(0, size_bytes - len(pdf))
+
+
+class TestTierDocumentCap:
+    def test_free_tier_second_upload_in_same_session_is_rejected(self, monkeypatch):
+        _use_upload_limits(monkeypatch, FREE_UPLOAD_LIMITS)
+        client = SessionClient(_make_test_app())
+
+        assert _upload(client, session_id="s1").status_code == 201
+        response = _upload(client, session_id="s1")
+
+        assert response.status_code == 403
+        detail = response.json()["detail"]
+        assert detail["code"] == "tier_limit"
+        assert detail["limit"] == "upload_max_docs"
+        assert "upgrade" in detail["message"].lower()
+        assert len(_rows()) == 1
+
+    def test_free_tier_upload_in_a_different_session_succeeds(self, monkeypatch):
+        """The cap is per session (what the folder panel shows), not per user."""
+        _use_upload_limits(monkeypatch, FREE_UPLOAD_LIMITS)
+        client = SessionClient(_make_test_app())
+
+        assert _upload(client, session_id="s1").status_code == 201
+        assert _upload(client, session_id="s2").status_code == 201
+        assert len(_rows()) == 2
+
+    def test_pro_tier_second_upload_in_same_session_succeeds(self, monkeypatch):
+        _use_upload_limits(monkeypatch, PRO_UPLOAD_LIMITS)
+        client = SessionClient(_make_test_app())
+
+        assert _upload(client, session_id="s1").status_code == 201
+        assert _upload(client, session_id="s1").status_code == 201
+        assert len(_rows()) == 2
+
+    def test_other_users_documents_do_not_count(self, monkeypatch):
+        _use_upload_limits(monkeypatch, FREE_UPLOAD_LIMITS)
+
+        assert _upload(SessionClient(_make_test_app("user_bob")), session_id="s1").status_code == 201
+        assert _upload(SessionClient(_make_test_app("user_alice")), session_id="s1").status_code == 201
+
+    def test_over_limit_upload_is_rejected_before_the_file_is_read(self, monkeypatch):
+        _use_upload_limits(monkeypatch, FREE_UPLOAD_LIMITS)
+        client = SessionClient(_make_test_app())
+        assert _upload(client, session_id="s1").status_code == 201
+
+        read = AsyncMock(return_value=_make_real_pdf_bytes())
+        monkeypatch.setattr(StarletteUploadFile, "read", read)
+        response = _upload(client, session_id="s1")
+
+        assert response.status_code == 403
+        read.assert_not_awaited()
+
+    def test_count_is_scoped_to_the_uploads_session_and_thread(self, monkeypatch):
+        _use_upload_limits(monkeypatch, PRO_UPLOAD_LIMITS)
+        count = AsyncMock(return_value=0)
+        monkeypatch.setattr(FAKE_STORE_HOLDER.store, "count_documents", count)
+
+        _upload(SessionClient(_make_test_app()), session_id="s1", thread_id="t1")
+
+        count.assert_awaited_once_with("user_alice", session_id="s1", thread_id="t1")
+
+    def test_no_tier_doc_limit_means_no_count_query(self, monkeypatch):
+        count = AsyncMock(return_value=999)
+        monkeypatch.setattr(FAKE_STORE_HOLDER.store, "count_documents", count)
+
+        assert _upload(SessionClient(_make_test_app()), session_id="s1").status_code == 201
+        count.assert_not_awaited()
+
+
+class TestTierSizeLimit:
+    def test_content_length_over_tier_limit_is_a_tier_error(self, monkeypatch):
+        _use_upload_limits(monkeypatch, FREE_UPLOAD_LIMITS)  # 1MB
+        client = SessionClient(_make_test_app())
+
+        response = client.post(
+            "/documents/upload",
+            files={"file": ("big.pdf", _padded_pdf_bytes(1024 * 1024 + 1), "application/pdf")},
+        )
+
+        assert response.status_code == 403
+        detail = response.json()["detail"]
+        assert detail["code"] == "tier_limit"
+        assert detail["limit"] == "upload_max_size_mb"
+        assert "1MB" in detail["message"]
+        assert _rows() == {}
+
+    def test_actual_bytes_over_tier_limit_are_rejected_even_if_header_is_small(self, monkeypatch):
+        """Content-Length can be absent or spoofed, so the bytes actually
+        read must be checked against the tier limit too."""
+        _use_upload_limits(monkeypatch, FREE_UPLOAD_LIMITS)  # 1MB
+        monkeypatch.setattr(
+            StarletteUploadFile, "read", AsyncMock(return_value=_padded_pdf_bytes(1024 * 1024 + 1))
+        )
+        client = SessionClient(_make_test_app())
+
+        response = _upload(client, session_id="s1")  # small real PDF on the wire
+
+        assert response.status_code == 403
+        assert response.json()["detail"]["limit"] == "upload_max_size_mb"
+        assert _rows() == {}
+
+    def test_file_under_tier_limit_succeeds(self, monkeypatch):
+        _use_upload_limits(monkeypatch, FREE_UPLOAD_LIMITS)
+
+        assert _upload(SessionClient(_make_test_app()), session_id="s1").status_code == 201
+
+    def test_global_limit_still_caps_a_larger_tier_limit(self, monkeypatch):
+        """A tier limit above UPLOAD_MAX_SIZE_MB never lifts the global cap,
+        and going over the global cap stays a plain 413, not an upgrade prompt."""
+        _use_upload_limits(monkeypatch, PRO_UPLOAD_LIMITS)  # 20MB
+        monkeypatch.setattr(documents_module, "UPLOAD_MAX_SIZE_BYTES", 10)
+
+        response = _upload(SessionClient(_make_test_app()), session_id="s1")
+
+        assert response.status_code == 413
+        assert _rows() == {}
+
+
+class TestCheckUploadSize:
+    def test_under_both_limits_passes(self):
+        documents_module._check_upload_size(1024, tier_max_mb=1)
+
+    def test_over_tier_limit_raises_tier_error(self):
+        with pytest.raises(HTTPException) as exc:
+            documents_module._check_upload_size(1024 * 1024 + 1, tier_max_mb=1)
+        assert exc.value.status_code == 403
+
+    def test_no_tier_limit_uses_global_limit(self, monkeypatch):
+        monkeypatch.setattr(documents_module, "UPLOAD_MAX_SIZE_BYTES", 100)
+        with pytest.raises(HTTPException) as exc:
+            documents_module._check_upload_size(101, tier_max_mb=None)
+        assert exc.value.status_code == 413
+
+
+class TestCountDocumentsStore:
+    @pytest.mark.asyncio
+    async def test_count_is_zero_without_a_session_or_thread(self):
+        """Matches list_documents: with nothing to scope to, never count all
+        of the user's documents. Returns before any database access."""
+        assert await real_documents_store.count_documents("user_alice") == 0

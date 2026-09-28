@@ -379,8 +379,31 @@ async def research_report(thread_id: str, user_id: str = Depends(get_current_use
 
 @router.get("/{thread_id}/report/pdf")
 async def research_report_pdf(thread_id: str, user_id: str = Depends(get_current_user)) -> Response:
-    """Same report as GET /report, rendered as a downloadable PDF."""
+    """Same report as GET /report, rendered as a downloadable PDF.
+
+    PDF export is a plan feature: a tier without pdf_export_enabled gets a
+    403 tier_limit with an upgrade message, and keeps the Markdown report
+    from GET /report. Checked before the report is loaded or rendered.
+    """
     from backend.agents.report_assembly import render_pdf
+
+    # getattr default keeps today's behaviour (PDF for every tier) until
+    # backend/tiers.py defines pdf_export_enabled.
+    limits = get_tier_config(await get_user_tier(user_id))
+    if not getattr(limits, "pdf_export_enabled", True):
+        # TODO: switch to the shared tier-rejection helper once backend/tiers.py
+        # defines it, so every tier limit returns one shape.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "tier_limit",
+                "limit": "pdf_export_enabled",
+                "message": (
+                    "PDF export is available on Pro and Team plans -- upgrade to "
+                    "download your report as a PDF. The Markdown report is still available."
+                ),
+            },
+        )
 
     report_response = await research_report(thread_id, user_id)
     pdf_bytes = render_pdf(report_response.report)

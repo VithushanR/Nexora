@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, MetaData, Table, Text, delete, or_, select
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, MetaData, Table, Text, delete, func, or_, select
 
 from backend.db import async_session_factory
 
@@ -119,6 +119,35 @@ async def list_documents(
             .order_by(documents_table.c.created_at.asc(), documents_table.c.document_id.asc())
         )
         return [_row_to_document(row) for row in result.mappings().all()]
+
+
+async def count_documents(
+    user_id: str,
+    *,
+    session_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+) -> int:
+    """How many documents list_documents() would return for the same scope.
+
+    Scoped per session/thread, not per user: the upload limit is enforced
+    against the folder panel the user can actually see, so it never asks
+    them to delete files from a session they aren't looking at. With
+    neither id given the count is 0, matching list_documents()."""
+    scopes = []
+    if session_id:
+        scopes.append(documents_table.c.session_id == session_id)
+    if thread_id:
+        scopes.append(documents_table.c.thread_id == thread_id)
+    if not scopes:
+        return 0
+
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(func.count())
+            .select_from(documents_table)
+            .where(documents_table.c.user_id == user_id, or_(*scopes))
+        )
+        return result.scalar_one()
 
 
 async def delete_document(document_id: str) -> None:

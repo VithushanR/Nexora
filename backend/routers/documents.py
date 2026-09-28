@@ -46,9 +46,11 @@ from backend import documents_store
 from backend.auth.encryption import decrypt_bytes, encrypt_bytes
 from backend.auth.jwt import get_current_user
 from backend.auth.sanitize import sanitize_for_prompt
+from backend.auth.users import get_user_tier
 from backend.documents_store import Document
 from backend.rag.chat import build_index
 from backend.routers.copilot import require_owned_thread
+from backend.tiers import get_tier_config
 
 logger = logging.getLogger("nexora.documents")
 
@@ -163,6 +165,50 @@ def _clean_id(value: Optional[str]) -> Optional[str]:
     return value[:MAX_ID_CHARS] or None
 
 
+async def _upload_limits(user_id: str) -> tuple[Optional[int], Optional[int]]:
+    """Return (max_docs, max_size_mb) for the caller's account tier.
+
+    Either value is None when the tier sets no limit of its own. The getattr
+    defaults keep today's behaviour (no document cap, only the global
+    UPLOAD_MAX_SIZE_MB) until backend/tiers.py defines upload_max_docs /
+    upload_max_size_mb.
+    """
+    limits = get_tier_config(await get_user_tier(user_id))
+    return getattr(limits, "upload_max_docs", None), getattr(limits, "upload_max_size_mb", None)
+
+
+def _tier_limit_error(limit: str, message: str) -> HTTPException:
+    # TODO: switch to the shared tier-rejection helper once backend/tiers.py
+    # defines it, so uploads, PDF export and the monthly run limit all
+    # return one shape the frontend can turn into a single upgrade prompt.
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={"code": "tier_limit", "limit": limit, "message": message},
+    )
+
+
+def _check_upload_size(size_bytes: int, tier_max_mb: Optional[int]) -> None:
+    """Reject an upload over min(tier limit, global UPLOAD_MAX_SIZE_MB).
+
+    Over the tier's own limit is a plan limit (403 tier_limit, with an
+    upgrade message); over the global limit is a hard server limit that no
+    plan lifts (413, as before).
+    """
+    tier_max_bytes = tier_max_mb * 1024 * 1024 if tier_max_mb is not None else None
+    if tier_max_bytes is not None and tier_max_bytes < UPLOAD_MAX_SIZE_BYTES:
+        if size_bytes > tier_max_bytes:
+            raise _tier_limit_error(
+                "upload_max_size_mb",
+                f"Your plan allows files up to {tier_max_mb}MB -- upgrade to upload larger files.",
+            )
+        return
+    if size_bytes > UPLOAD_MAX_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File exceeds the {UPLOAD_MAX_SIZE_MB}MB upload limit.",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -181,8 +227,9 @@ async def upload_document(
     against the caller's chat session and/or Deep Search thread so the
     session's document list survives a refresh.
 
-    Validation runs in the exact order specified in §D.1:
-        1. Content-Length size check
+    Validation runs in the exact order specified in §D.1, preceded by the
+    tier's per-session document cap (checked before the file is read):
+        1. Content-Length size check (tier limit, capped by the global one)
         2. Real PDF magic-byte check (not just filename/extension)
         3. Text extraction (treated as fully untrusted)
         4. Chunk + embed into an isolated namespace
@@ -198,23 +245,30 @@ async def upload_document(
     if thread_id:
         await require_owned_thread(thread_id, user_id)
 
-    # --- 1. Size check ---
-    content_length = request.headers.get("content-length")
-    if content_length is not None and int(content_length) > UPLOAD_MAX_SIZE_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File exceeds the {UPLOAD_MAX_SIZE_MB}MB upload limit.",
+    # --- Tier document cap, before the file is read into memory. Counted
+    # in the same session/thread scope as the folder panel shows. ---
+    max_docs, tier_max_mb = await _upload_limits(user_id)
+    if max_docs is not None:
+        existing = await documents_store.count_documents(
+            user_id, session_id=session_id, thread_id=thread_id
         )
+        if existing >= max_docs:
+            raise _tier_limit_error(
+                "upload_max_docs",
+                f"Your plan allows {max_docs} document(s) per session -- "
+                f"upgrade to upload more, or remove one first.",
+            )
+
+    # --- 1. Size check (tier limit, capped by the global limit) ---
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        _check_upload_size(int(content_length), tier_max_mb)
 
     file_bytes = await file.read()
 
     # Content-Length can be absent/spoofed, so re-check the actual bytes
     # read regardless of what the header claimed.
-    if len(file_bytes) > UPLOAD_MAX_SIZE_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File exceeds the {UPLOAD_MAX_SIZE_MB}MB upload limit.",
-        )
+    _check_upload_size(len(file_bytes), tier_max_mb)
 
     # --- 2. Real PDF magic-byte check ---
     if not file_bytes.startswith(_PDF_MAGIC_BYTES):
