@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import Sidebar from "./components/Sidebar";
 import SearchPage from "./pages/SearchPage";
 import LoginPage from "./pages/LoginPage";
+import PlansPage from "./pages/PlansPage";
 import { AuthProvider, useAuth } from "./auth/AuthContext";
 
 export default function App() {
@@ -99,6 +100,7 @@ function AppShell({
       <main className="flex-1 overflow-hidden">
         <Routes>
           <Route path="/" element={<SearchPage />} />
+          <Route path="/plans" element={<PlansPage />} />
           {/* Item 4/5/7: search, selection, synthesis progress, and the
               final report all render inside SearchPage as one persistent
               chat thread -- /t/:threadId resumes an existing thread (e.g.

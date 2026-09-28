@@ -12,6 +12,8 @@ interface HistoryEntry {
 
 const HISTORY_CHANGED_EVENT = "nexora-history-changed";
 
+const MONTHLY_RESEARCH_LIMIT = { free: 3, pro: 50, team: null } as const;
+
 export function getHistory(): HistoryEntry[] {
   try {
     return JSON.parse(localStorage.getItem("nexora_history") || "[]");
@@ -70,6 +72,13 @@ export default function Sidebar() {
 
   const accountLabel = user?.name || user?.email || "Signed in";
   const accountInitial = accountLabel.charAt(0).toUpperCase();
+  const accountTier = user?.tier ?? "free";
+  const monthlyLimit = MONTHLY_RESEARCH_LIMIT[accountTier];
+  const monthStart = new Date();
+  monthStart.setDate(1);
+  monthStart.setHours(0, 0, 0, 0);
+  const runsThisMonth = history.filter((entry) => entry.timestamp >= monthStart.getTime()).length;
+  const remainingRuns = monthlyLimit === null ? null : Math.max(0, monthlyLimit - runsThisMonth);
 
   const isHome = location.pathname === "/";
 
@@ -213,6 +222,8 @@ export default function Sidebar() {
           <div className="relative">
             <button
               onClick={() => setAccountMenuOpen((v) => !v)}
+              aria-expanded={accountMenuOpen}
+              aria-haspopup="menu"
               className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 dark:text-slate-400 dark:hover:bg-slate-800"
             >
               {user?.picture ? (
@@ -227,23 +238,71 @@ export default function Sidebar() {
                   {accountInitial}
                 </div>
               )}
-              <span className="flex-1 truncate text-left">{accountLabel}</span>
+              <span className="min-w-0 flex-1 text-left">
+                <span className="flex items-center gap-2">
+                  <span className="truncate">{accountLabel}</span>
+                  <span className="shrink-0 rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-semibold capitalize text-violet-700 dark:bg-violet-900/60 dark:text-violet-300">
+                    {accountTier}
+                  </span>
+                </span>
+                <span className="mt-0.5 block text-[11px] font-normal text-slate-400 dark:text-slate-500">
+                  {remainingRuns === null
+                    ? "Unlimited research runs"
+                    : `${remainingRuns} of ${monthlyLimit} research runs left this month`}
+                </span>
+              </span>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
                 <path d="M7 10l5-5 5 5M7 14l5 5 5-5" />
               </svg>
             </button>
 
             {accountMenuOpen && (
-              <div className="absolute bottom-full left-0 mb-2 w-full rounded-xl border border-slate-200 bg-white p-1.5 shadow-lg dark:border-slate-700 dark:bg-slate-800">
+              <div role="menu" className="absolute bottom-full left-0 mb-2 w-full overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg dark:border-slate-700 dark:bg-slate-800">
+                <div className="px-3.5 py-3">
+                  <p className="truncate text-sm font-semibold text-slate-900 dark:text-white">
+                    {accountLabel}
+                  </p>
+                  {user?.email && user.email !== accountLabel && (
+                    <p className="mt-0.5 truncate text-xs text-slate-500 dark:text-slate-400">
+                      {user.email}
+                    </p>
+                  )}
+                  <p className="mt-1.5 text-[11px] capitalize text-violet-600 dark:text-violet-300">
+                    {accountTier} plan
+                  </p>
+                </div>
+                <div className="border-t border-slate-100 p-1.5 dark:border-slate-700">
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      navigate("/plans");
+                      setAccountMenuOpen(false);
+                    }}
+                    className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm font-medium text-slate-700 transition hover:bg-violet-50 hover:text-violet-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:text-slate-200 dark:hover:bg-violet-950/50 dark:hover:text-violet-300"
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <path d="M12 3l1.6 5.4L19 10l-5.4 1.6L12 17l-1.6-5.4L5 10l5.4-1.6L12 3z" />
+                      <path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8L19 16z" />
+                    </svg>
+                    Upgrade plan
+                  </button>
+                </div>
+                <div className="border-t border-slate-100 p-1.5 dark:border-slate-700">
                 <button
+                  role="menuitem"
                   onClick={() => {
                     signOut();
                     setAccountMenuOpen(false);
                   }}
-                  className="w-full rounded-md px-3 py-2 text-left text-sm text-slate-600 hover:bg-slate-50 dark:text-slate-400 dark:hover:bg-slate-700"
+                  className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm text-slate-600 transition hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 dark:text-slate-400 dark:hover:bg-slate-700"
                 >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M10 17l5-5-5-5M15 12H3" />
+                    <path d="M14 3h5a2 2 0 012 2v14a2 2 0 01-2 2h-5" />
+                  </svg>
                   Sign out
                 </button>
+                </div>
               </div>
             )}
           </div>

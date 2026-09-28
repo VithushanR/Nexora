@@ -14,7 +14,7 @@ Run with: pytest backend/tests/test_synthesis_integrity.py -v
 import numpy as np
 import pytest
 from typing import cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 from backend.agents.synthesis_integrity import (
     split_sections, is_system_note, comparable_row_indices,
@@ -23,6 +23,7 @@ from backend.agents.synthesis_integrity import (
 )
 from backend.sources.crossref import check_retraction
 from backend.graph.state import Candidate, ResearchState
+from backend.tiers import TierName, get_tier_config
 
 AGENT = "backend.agents.synthesis_integrity"
 
@@ -123,6 +124,59 @@ async def test_full_text_row_is_labelled_with_its_strategy():
     assert row["full_text_available"] is True
     assert row["summary_source"] == "full_text (arxiv)"
     assert not is_system_note(row["results_summary"])
+
+
+@pytest.mark.asyncio
+async def test_free_tier_evidence_only_requests_arxiv_then_uses_abstract_fallback():
+    paper = make_candidate(arxiv_id="2301.00001")
+    limits = get_tier_config(TierName.FREE)
+
+    with patch(f"{AGENT}.get_full_text", new=AsyncMock(return_value=(None, None))) as fulltext, \
+         patch(f"{AGENT}.summarize_section", new=AsyncMock(return_value="A summary.")), \
+         patch(f"{AGENT}.check_retraction", new=AsyncMock(return_value={
+             "retracted": False, "status": "clean", "note": "checked"})):
+        row = await build_evidence_row(
+            AsyncMock(), paper, fulltext_strategies=limits.fulltext_strategies
+        )
+
+    assert limits.fulltext_strategies == ("arxiv",)
+    fulltext.assert_awaited_once_with(
+        ANY,
+        dict(paper),
+        allowed_strategies=("arxiv",),
+    )
+    assert row["full_text_strategy"] == "(none)"
+    assert row["summary_source"] == "abstract_fallback"
+
+
+@pytest.mark.asyncio
+async def test_free_tier_records_arxiv_strategy_without_trying_paid_cascade():
+    calls: list[str] = []
+
+    async def known_oa(_client, _paper):
+        calls.append("known_oa_pdf")
+        return "Deep Learning for Crop Disease Detection\n" + "x" * 600
+
+    async def arxiv(_client, _paper):
+        calls.append("arxiv")
+        return "Deep Learning for Crop Disease Detection\n" + "x" * 600
+
+    strategies = [("known_oa_pdf", known_oa), ("arxiv", arxiv)]
+    limits = get_tier_config(TierName.FREE)
+
+    with patch("backend.sources.fulltext.FULLTEXT_STRATEGIES", strategies), \
+         patch(f"{AGENT}.summarize_section", new=AsyncMock(return_value="A summary.")), \
+         patch(f"{AGENT}.check_retraction", new=AsyncMock(return_value={
+             "retracted": False, "status": "clean", "note": "checked"})):
+        row = await build_evidence_row(
+            AsyncMock(),
+            make_candidate(arxiv_id="2301.00001"),
+            fulltext_strategies=limits.fulltext_strategies,
+        )
+
+    assert calls == ["arxiv"]
+    assert row["full_text_strategy"] == "arxiv"
+    assert row["summary_source"] == "full_text (arxiv)"
 
 
 # ------------------------------------------------------------------
@@ -440,7 +494,7 @@ async def test_one_failing_paper_does_not_lose_the_others():
 
 @pytest.mark.asyncio
 async def test_node_writes_only_the_three_fields_it_owns():
-    state = {"domain": "d", "protocol": {}, "candidates": [],
+    state = {"tier": TierName.PRO, "domain": "d", "protocol": {}, "candidates": [],
              "selected_papers": [make_candidate()], "gaps": ["should not be touched"]}
 
     with patch(f"{AGENT}.build_evidence_table", new=AsyncMock(return_value=[make_row()])), \
@@ -450,6 +504,41 @@ async def test_node_writes_only_the_three_fields_it_owns():
         result = await synthesis_integrity_node(cast(ResearchState, state))
 
     assert set(result) == {"evidence_table", "contradictions", "contradictions_status"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tier, concurrency, max_pairs, strategies",
+    [
+        (TierName.FREE, 2, 10, ("arxiv",)),
+        (TierName.PRO, 4, 20, get_tier_config(TierName.PRO).fulltext_strategies),
+        (TierName.TEAM, 8, 40, get_tier_config(TierName.TEAM).fulltext_strategies),
+    ],
+)
+async def test_node_applies_tier_scoped_agent3_limits(tier, concurrency, max_pairs, strategies):
+    selected = [make_candidate()]
+    with patch(f"{AGENT}.run_synthesis_and_integrity", new=AsyncMock(return_value={
+        "evidence_table": [], "contradictions": [], "contradictions_status": {}
+    })) as run:
+        await synthesis_integrity_node(cast(ResearchState, {
+            "tier": tier,
+            "selected_papers": selected,
+        }))
+
+    run.assert_awaited_once_with(
+        selected,
+        concurrency=concurrency,
+        max_contradiction_pairs=max_pairs,
+        fulltext_strategies=strategies,
+    )
+
+
+@pytest.mark.asyncio
+async def test_node_refuses_to_run_without_tier():
+    with pytest.raises(ValueError, match=r"state\['tier'\]"):
+        await synthesis_integrity_node(cast(ResearchState, {
+            "selected_papers": [make_candidate()],
+        }))
 
 
 @pytest.mark.asyncio
