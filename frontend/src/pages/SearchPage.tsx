@@ -19,6 +19,7 @@ import {
   listDocuments,
   sendChat,
   indexCopilot,
+  tierUpgradeMessage,
 } from "../api/client";
 import { NEW_SESSION_EVENT, createSessionId, getOrCreateSessionId, storeSessionId } from "../chatSession";
 import { useAuth } from "../auth/AuthContext";
@@ -149,6 +150,8 @@ const CHAT_MD: Components = {
 };
 
 function userFacingError(error: unknown): string {
+  const upgradeMessage = tierUpgradeMessage(error);
+  if (upgradeMessage) return upgradeMessage;
   if (error instanceof ApiClientError) {
     if (error.code === "SAFETY_UNSAFE") {
       return "This topic cannot be processed as a research request. Please choose a different academic topic.";
@@ -496,7 +499,7 @@ export default function SearchPage() {
       if (e instanceof ApiClientError && e.status === 401) {
         handleUnauthorized();
       } else {
-        setErrorMessage(e instanceof ApiError ? e.message : "Upload failed.");
+        setErrorMessage(tierUpgradeMessage(e) ?? (e instanceof ApiError ? e.message : "Upload failed."));
       }
     } finally {
       setUploading(false);
@@ -647,6 +650,11 @@ export default function SearchPage() {
       } catch (e) {
         if (e instanceof ApiClientError && e.status === 401) {
           handleUnauthorized();
+        }
+        const upgradeMessage = tierUpgradeMessage(e);
+        if (upgradeMessage) {
+          setErrorMessage(upgradeMessage);
+          return;
         }
         const content =
           e instanceof ApiClientError && e.status === 429

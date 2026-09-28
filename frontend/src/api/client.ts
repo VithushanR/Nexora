@@ -56,6 +56,22 @@ export class ApiNetworkError extends ApiError {
   }
 }
 
+const TIER_LIMIT_CODE = /(?:TIER|PLAN|UPGRADE|MONTHLY_QUOTA|UPLOAD_LIMIT|PDF_EXPORT|WEB_SEARCH|WRITING_ASSISTANT)/i;
+
+/** Return upgrade copy only for backend responses that represent plan limits. */
+export function tierUpgradeMessage(error: unknown): string | null {
+  if (!(error instanceof ApiClientError)) return null;
+  const isTierLimit =
+    error.status === 402 ||
+    error.status === 403 ||
+    (typeof error.code === "string" && TIER_LIMIT_CODE.test(error.code));
+  if (!isTierLimit) return null;
+
+  const message = error.message.trim();
+  if (/upgrad/i.test(message)) return message;
+  return `${message} Upgrade your plan to continue.`;
+}
+
 export function setAuthHeadersProvider(provider?: AuthHeadersProvider): void {
   authHeadersProvider = provider;
 }
@@ -104,6 +120,7 @@ export interface AuthUser {
   name: string | null;
   email: string | null;
   picture: string | null;
+  tier?: "free" | "pro" | "team";
 }
 
 const AUTH_USER_STORAGE_KEY = "nexora_auth_user";
@@ -232,6 +249,7 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
 export interface GoogleLoginResponse {
   access_token: string;
   token_type: string;
+  tier?: "free" | "pro" | "team";
 }
 
 export async function loginWithGoogle(idToken: string): Promise<GoogleLoginResponse> {

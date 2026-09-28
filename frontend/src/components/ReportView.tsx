@@ -7,7 +7,7 @@ import { useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-import { ApiError, downloadResearchReportPdf } from "../api/client";
+import { ApiError, downloadResearchReportPdf, tierUpgradeMessage } from "../api/client";
 
 const REPORT_MARKDOWN_COMPONENTS: Components = {
   h1: ({ children }) => (
@@ -76,7 +76,10 @@ export default function ReportView({ threadId, report }: ReportViewProps) {
       link.remove();
       URL.revokeObjectURL(url);
     } catch (e) {
-      setDownloadError(e instanceof ApiError ? e.message : "The report PDF could not be downloaded.");
+      setDownloadError(
+        tierUpgradeMessage(e) ??
+          (e instanceof ApiError ? e.message : "The report PDF could not be downloaded."),
+      );
     } finally {
       setDownloadingPdf(false);
     }

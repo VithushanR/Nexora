@@ -33,6 +33,7 @@ import re
 import asyncio
 import logging
 import xml.etree.ElementTree as ET
+from collections.abc import Collection
 from typing import Callable, Optional
 
 import httpx
@@ -289,13 +290,23 @@ FULLTEXT_STRATEGIES: list[tuple[str, Callable]] = [
 ]
 
 
-async def get_full_text(client: httpx.AsyncClient, paper: dict) -> tuple[Optional[str], Optional[str]]:
-    """Tries every strategy in order. Returns (text, strategy_name) on the
-    first success that clears both the length floor and the title check, or
-    (None, None) if all seven fail -- which is a normal outcome, not an
-    error, and the caller labels the row as abstract-derived."""
+async def get_full_text(
+    client: httpx.AsyncClient,
+    paper: dict,
+    allowed_strategies: Collection[str] | None = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Try allowed strategies in canonical cascade order.
+
+    ``None`` preserves the complete seven-strategy cascade for standalone
+    callers. Agent 3 passes the requesting account's tier-scoped names. If
+    every allowed strategy misses, the caller uses its labelled abstract
+    fallback.
+    """
     title = paper.get("title")
+    allowed = set(allowed_strategies) if allowed_strategies is not None else None
     for name, fn in FULLTEXT_STRATEGIES:
+        if allowed is not None and name not in allowed:
+            continue
         try:
             text = await fn(client, paper)
         except Exception as e:

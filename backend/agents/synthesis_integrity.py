@@ -52,6 +52,7 @@ from backend.llm.embeddings import (
 from backend.sources.crossref import check_retraction, RetractionStatus
 from backend.sources.fulltext import get_full_text
 from backend.graph.state import ResearchState, Candidate
+from backend.tiers import get_tier_config
 
 logger = logging.getLogger("nexora.agent3")
 
@@ -274,11 +275,22 @@ async def integrity_check(client: httpx.AsyncClient, paper: Candidate) -> Retrac
     return await check_retraction(client, None)
 
 
-async def build_evidence_row(client: httpx.AsyncClient, paper: Candidate) -> dict:
+async def build_evidence_row(
+    client: httpx.AsyncClient,
+    paper: Candidate,
+    fulltext_strategies: tuple[str, ...] | None = None,
+) -> dict:
     title = paper.get("title") or "(untitled)"
     abstract = paper.get("abstract") or ""
 
-    full_text, strategy = await get_full_text(client, dict(paper))
+    if fulltext_strategies is None:
+        full_text, strategy = await get_full_text(client, dict(paper))
+    else:
+        full_text, strategy = await get_full_text(
+            client,
+            dict(paper),
+            allowed_strategies=fulltext_strategies,
+        )
     full_text_available = full_text is not None
 
     abstract_summary = await summarize_section("abstract", abstract, title)
@@ -347,8 +359,11 @@ def _failed_row(paper: Candidate, error: Exception) -> dict:
     }
 
 
-async def build_evidence_table(selected_papers: list[Candidate],
-                               concurrency: int = PAPER_CONCURRENCY) -> list[dict]:
+async def build_evidence_table(
+    selected_papers: list[Candidate],
+    concurrency: int = PAPER_CONCURRENCY,
+    fulltext_strategies: tuple[str, ...] | None = None,
+) -> list[dict]:
     """Bounded concurrency, not full fan-out: each paper costs up to seven
     HTTP fetches plus three LLM calls, so 20 papers unleashed at once would
     breach both the source rate limits and the Gemini quota.
@@ -365,7 +380,11 @@ async def build_evidence_table(selected_papers: list[Candidate],
         async def _one(index: int, paper: Candidate) -> tuple[int, dict]:
             async with semaphore:
                 try:
-                    return index, await build_evidence_row(client, paper)
+                    if fulltext_strategies is None:
+                        return index, await build_evidence_row(client, paper)
+                    return index, await build_evidence_row(
+                        client, paper, fulltext_strategies=fulltext_strategies
+                    )
                 except Exception as e:
                     logger.exception("Evidence row failed for %r", (paper.get("title") or "")[:60])
                     return index, _failed_row(paper, e)
@@ -487,7 +506,10 @@ def _status(code: str, message: str, is_error: bool = False, **extra) -> dict:
     return {"code": code, "is_error": is_error, "message": message, **extra}
 
 
-async def detect_contradictions(evidence_table: list[dict]) -> tuple[list[dict], dict]:
+async def detect_contradictions(
+    evidence_table: list[dict],
+    max_pairs: int = MAX_CONTRADICTION_PAIRS,
+) -> tuple[list[dict], dict]:
     """Returns (contradictions, status). An empty list is only ever
     reported as a finding when the analysis actually ran to completion;
     every failure path sets is_error=True and says what broke."""
@@ -509,7 +531,7 @@ async def detect_contradictions(evidence_table: list[dict]) -> tuple[list[dict],
         )
 
     try:
-        pairs = await shortlist_contradiction_pairs(evidence_table)
+        pairs = await shortlist_contradiction_pairs(evidence_table, max_pairs=max_pairs)
     except EmbeddingUnavailableError as e:
         logger.error("Contradiction shortlisting unavailable: %s", e)
         return [], _status(
@@ -581,9 +603,19 @@ async def detect_contradictions(evidence_table: list[dict]) -> tuple[list[dict],
 # Orchestration + LangGraph node
 # ------------------------------------------------------------------
 
-async def run_synthesis_and_integrity(selected_papers: list[Candidate]) -> dict:
+async def run_synthesis_and_integrity(
+    selected_papers: list[Candidate],
+    *,
+    concurrency: int = PAPER_CONCURRENCY,
+    max_contradiction_pairs: int = MAX_CONTRADICTION_PAIRS,
+    fulltext_strategies: tuple[str, ...] | None = None,
+) -> dict:
     logger.info("Agent 3: building evidence table for %d selected paper(s)", len(selected_papers))
-    evidence_table = await build_evidence_table(selected_papers)
+    evidence_table = await build_evidence_table(
+        selected_papers,
+        concurrency=concurrency,
+        fulltext_strategies=fulltext_strategies,
+    )
 
     with_full_text = sum(1 for r in evidence_table if r.get("full_text_available"))
     retracted = sum(1 for r in evidence_table if r.get("retracted") is True)
@@ -591,7 +623,10 @@ async def run_synthesis_and_integrity(selected_papers: list[Candidate]) -> dict:
     logger.info("Evidence table: %d rows, %d with full text, %d retracted, %d unverified",
                 len(evidence_table), with_full_text, retracted, unverified)
 
-    contradictions, status = await detect_contradictions(evidence_table)
+    contradictions, status = await detect_contradictions(
+        evidence_table,
+        max_pairs=max_contradiction_pairs,
+    )
     logger.info("Contradictions: %d [%s]", len(contradictions), status["code"])
 
     return {
@@ -615,4 +650,14 @@ async def synthesis_integrity_node(state: ResearchState) -> dict:
             "synthesis_integrity_node requires a non-empty state['selected_papers'] -- "
             "the human selection checkpoint must run before Agent 3."
         )
-    return await run_synthesis_and_integrity(selected_papers)
+    tier = state.get("tier")
+    if tier is None:
+        raise ValueError("synthesis_integrity_node requires state['tier'] to be set.")
+
+    limits = get_tier_config(tier)
+    return await run_synthesis_and_integrity(
+        selected_papers,
+        concurrency=limits.synthesis_concurrency,
+        max_contradiction_pairs=limits.max_contradiction_pairs,
+        fulltext_strategies=limits.fulltext_strategies,
+    )

@@ -95,14 +95,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!response.credential) return;
     setSignInError(null);
     try {
-      const { access_token } = await loginWithGoogle(response.credential);
+      const login = await loginWithGoogle(response.credential);
       const googlePayload = decodeJwtPayload(response.credential);
+      const appPayload = decodeJwtPayload(login.access_token);
+      const tierClaim = stringClaim(appPayload, "tier") ?? login.tier;
+      const tier = tierClaim === "pro" || tierClaim === "team" ? tierClaim : "free";
       const nextUser: AuthUser = {
         name: stringClaim(googlePayload, "name"),
         email: stringClaim(googlePayload, "email"),
         picture: stringClaim(googlePayload, "picture"),
+        tier,
       };
-      setAuthToken(access_token);
+      setAuthToken(login.access_token);
       setAuthUser(nextUser);
       setUser(nextUser);
       setStatus("signed-in");
