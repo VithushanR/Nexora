@@ -14,7 +14,6 @@ interface Plan {
   annualMonthlyPrice: number;
   capacity: Array<{ value: string; label: string }>;
   features: string[];
-  accent: "quiet" | "violet" | "ink";
 }
 
 const SELECTED_PLAN_KEY = "nexora_selected_plan";
@@ -37,7 +36,6 @@ const PLANS: Plan[] = [
       "Reduced but honest gap discovery",
       "Markdown report export",
     ],
-    accent: "quiet",
   },
   {
     name: "pro",
@@ -58,7 +56,6 @@ const PLANS: Plan[] = [
       "Branded PDF report export",
       "20 contradiction pairs per review",
     ],
-    accent: "violet",
   },
   {
     name: "team",
@@ -79,7 +76,6 @@ const PLANS: Plan[] = [
       "Full-depth gap discovery",
       "20 concurrent screening workers",
     ],
-    accent: "ink",
   },
 ];
 
@@ -105,6 +101,8 @@ export default function PlansPage() {
   const currentPlan = user?.tier ?? "free";
   const [billingCycle, setBillingCycle] = useState<BillingCycle>("annual");
   const [selectedPlan, setSelectedPlan] = useState<PlanName | null>(loadSelectedPlan);
+  const [hoveredPaidPlan, setHoveredPaidPlan] = useState<"pro" | "team" | null>(null);
+  const highlightedPlan = hoveredPaidPlan ?? "pro";
 
   function selectPlan(plan: PlanName) {
     setSelectedPlan(plan);
@@ -174,26 +172,41 @@ export default function PlansPage() {
           {PLANS.map((plan) => {
             const isCurrent = currentPlan === plan.name;
             const isSelected = selectedPlan === plan.name && !isCurrent;
+            const isHighlighted = plan.name === highlightedPlan;
             const price = billingCycle === "annual" ? plan.annualMonthlyPrice : plan.monthlyPrice;
             const buttonClass =
-              plan.accent === "violet"
+              isHighlighted
                 ? "bg-violet-600 text-white hover:bg-violet-500"
-                : plan.accent === "ink"
+                : plan.name === "pro" || plan.name === "team"
                   ? "bg-slate-900 text-white hover:bg-slate-800 dark:bg-white dark:text-slate-950 dark:hover:bg-slate-200"
                   : "border border-slate-300 bg-white text-slate-800 hover:border-violet-300 hover:text-violet-700 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-200";
 
             return (
               <article
                 key={plan.name}
-                className={`relative flex min-h-[610px] flex-col overflow-hidden rounded-2xl border bg-white dark:bg-slate-900 ${
-                  plan.accent === "violet"
+                onMouseEnter={() => {
+                  if (plan.name === "pro" || plan.name === "team") setHoveredPaidPlan(plan.name);
+                }}
+                onMouseLeave={() => {
+                  if (plan.name === "pro" || plan.name === "team") setHoveredPaidPlan(null);
+                }}
+                onFocusCapture={() => {
+                  if (plan.name === "pro" || plan.name === "team") setHoveredPaidPlan(plan.name);
+                }}
+                onBlurCapture={(event) => {
+                  if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                    setHoveredPaidPlan(null);
+                  }
+                }}
+                className={`relative flex min-h-[610px] flex-col overflow-hidden rounded-2xl border bg-white transition-[border-color,box-shadow] duration-200 dark:bg-slate-900 ${
+                  isHighlighted
                     ? "border-violet-400 shadow-[0_18px_50px_-30px_rgba(124,58,237,0.7)] dark:border-violet-600"
                     : "border-slate-200 dark:border-slate-800"
                 }`}
               >
-                {plan.accent === "violet" && (
+                {isHighlighted && (
                   <div className="bg-violet-600 px-5 py-2 text-center text-xs font-semibold text-white">
-                    Best for independent researchers
+                    {plan.name === "team" ? "Built for research at scale" : "Best for independent researchers"}
                   </div>
                 )}
 
