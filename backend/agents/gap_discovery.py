@@ -6,7 +6,7 @@ them as candidate research gaps -- each with an exact support count and the
 source quotes behind it. Also surfaces, separately, single-paper limitations
 that never reached that cross-paper bar -- see paper_limitations below.
 
-Reads : state["selected_papers"]
+Reads : state["selected_papers"], state["tier"]
 Writes: state["gaps"], state["paper_limitations"], state["gaps_status"]
 
 The pipeline runs in this order:
@@ -60,12 +60,11 @@ import asyncio
 import httpx
 import numpy as np
 from rapidfuzz import fuzz
-from sentence_transformers import SentenceTransformer
-from sklearn.cluster import AgglomerativeClustering
 
 from backend.llm.client import llm_json_call
 from backend.graph.state import ResearchState
 from backend.sources.fulltext import get_full_text
+from backend.tiers import get_tier_config
 
 # ============================================================
 # CONFIGURATION
@@ -85,6 +84,33 @@ VERIFY_THRESHOLD = 80  # only trust the AI's sentence if it matches the paper 80
 PAPER_CONCURRENCY = int(os.getenv("GAP_DISCOVERY_PAPER_CONCURRENCY", "4"))
 
 EMBED_MODEL = "all-MiniLM-L6-v2"
+
+
+# ============================================================
+# TIER LIMITS
+# ============================================================
+#
+# Free tier gets a shallower run, never a disabled one. The saving comes
+# from gap_max_papers: full-text fetching (up to seven HTTP requests per
+# paper) plus the Layer 3 LLM fallback dominate this agent's cost, and both
+# scale with the number of papers mined. gap_min_support stays at 2 on every
+# tier -- with only a handful of papers, raising it would usually leave the
+# free tier with no gaps at all, and paper_limitations is still returned in
+# full for whatever was mined, so a free user always sees the honest
+# single-paper findings this agent is built around.
+
+
+def tier_gap_limits(tier):
+    """Return (max_papers, min_support) for an account tier.
+
+    max_papers is None when the tier mines every selected paper. The
+    getattr defaults keep today's behaviour (no cap, MIN_SUPPORT) until
+    backend/tiers.py defines gap_max_papers / gap_min_support.
+    """
+    limits = get_tier_config(tier)
+    max_papers = getattr(limits, "gap_max_papers", None)
+    min_support = getattr(limits, "gap_min_support", MIN_SUPPORT)
+    return max_papers, min_support
 
 
 # ============================================================
@@ -130,6 +156,12 @@ def get_model():
     """Load the sentence-transformers model once, on first use."""
     global _model
     if _model is None:
+        # Imported on first use, like the model itself: sentence-transformers
+        # and scikit-learn are heavy native packages, and importing them at
+        # module load made every import of this agent (including tests that
+        # never embed anything) depend on their compiled DLLs loading.
+        from sentence_transformers import SentenceTransformer
+
         _model = SentenceTransformer(EMBED_MODEL)
     return _model
 
@@ -371,6 +403,9 @@ def cluster_limitations(limitations):
     if len(limitations) < 2:
         return {}
 
+    # Imported here rather than at module level -- see get_model().
+    from sklearn.cluster import AgglomerativeClustering
+
     statements = [text for _, text in limitations]
     vectors = embed(statements)
 
@@ -512,6 +547,13 @@ async def gap_discovery_node(state: ResearchState) -> dict:
     whenever ANY limitation was extracted, independent of that threshold --
     see build_paper_limitations for why these are kept separate from gaps.
     """
+    tier = state.get("tier")
+    if tier is None:
+        # Same fail-loud guard as Agent 2: silently defaulting would hand a
+        # user the wrong limits.
+        raise ValueError("gap_discovery_node requires state['tier'] to be set.")
+    max_papers, min_support = tier_gap_limits(tier)
+
     papers = state.get("selected_papers") or []
 
     if not papers:
@@ -525,6 +567,16 @@ async def gap_discovery_node(state: ResearchState) -> dict:
             },
         }
 
+    # Tell the user when their plan mined only part of the selection, so a
+    # thin result isn't mistaken for a thin literature.
+    cap_note = ""
+    if max_papers is not None and len(papers) > max_papers:
+        cap_note = (
+            f" Your plan analyses the first {max_papers} of {len(papers)} "
+            f"selected papers for gaps -- upgrade to analyse all of them."
+        )
+        papers = papers[:max_papers]
+
     limitations = await extract_limitations(papers)
 
     if not limitations:
@@ -535,7 +587,7 @@ async def gap_discovery_node(state: ResearchState) -> dict:
                 "code": "no_statements",
                 "message": (
                     "No limitation statements could be extracted from the selected "
-                    "papers -- usually because full text was unavailable."
+                    "papers -- usually because full text was unavailable." + cap_note
                 ),
                 "is_error": False,
             },
@@ -544,7 +596,7 @@ async def gap_discovery_node(state: ResearchState) -> dict:
     paper_limitations = build_paper_limitations(limitations)
 
     clusters = cluster_limitations(limitations)
-    survivors = apply_threshold(clusters)
+    survivors = apply_threshold(clusters, min_support=min_support)
     gaps = build_gaps(survivors, len(papers))
 
     if not gaps:
@@ -555,7 +607,7 @@ async def gap_discovery_node(state: ResearchState) -> dict:
                 "code": "none_met_threshold",
                 "message": (
                     f"Limitations were found but none was shared by at least "
-                    f"{MIN_SUPPORT} independent papers, so no gap was surfaced."
+                    f"{min_support} independent papers, so no gap was surfaced." + cap_note
                 ),
                 "is_error": False,
             },
@@ -566,7 +618,7 @@ async def gap_discovery_node(state: ResearchState) -> dict:
         "paper_limitations": paper_limitations,
         "gaps_status": {
             "code": "ok",
-            "message": f"{len(gaps)} candidate gap(s) surfaced.",
+            "message": f"{len(gaps)} candidate gap(s) surfaced." + cap_note,
             "is_error": False,
         },
     }
