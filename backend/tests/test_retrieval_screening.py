@@ -182,6 +182,20 @@ async def test_unverifiable_quote_downgrades_to_uncertain():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("empty_quote", ["", "   "])
+async def test_empty_or_blank_quote_downgrades_to_uncertain_not_bypassed(empty_quote):
+    """An empty string is trivially "in" any string in Python -- without an
+    explicit empty check, this would have silently passed verification and
+    kept an unsupported INCLUDE/EXCLUDE verdict."""
+    candidate = make_candidate(abstract="This paper studies deep learning for the test domain in detail.")
+    fake_response = {"verdict": "INCLUDE", "quote": empty_quote, "reason": "looked relevant"}
+    with patch("backend.agents.retrieval_screening.llm_json_call", new=AsyncMock(return_value=fake_response)):
+        result = await screen_candidate(candidate, PROTOCOL)
+    assert result["verdict"] == "UNCERTAIN"
+    assert "could not be verified" in result["reason"]
+
+
+@pytest.mark.asyncio
 async def test_verifiable_quote_keeps_original_verdict():
     abstract = "This paper studies deep learning for the test domain in great detail."
     candidate = make_candidate(abstract=abstract)

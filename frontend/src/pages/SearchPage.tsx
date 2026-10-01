@@ -615,9 +615,19 @@ export default function SearchPage() {
       // thread's finished report and/or the attached documents when there
       // are any (both at once, cited separately), else replies
       // conversationally. The client just says which mode and what's attached.
-      const reportThreadId = deepSearchStage === "done" ? threadId : null;
+      //
+      // Always send whatever threadId this page currently has -- the
+      // backend's own _resolve_contexts() already checks the thread is
+      // actually "done" before grounding on it, so gating this on
+      // deepSearchStage here was redundant, AND meant a real, finished
+      // thread's id could be silently withheld from the request (invisible
+      // to error/diagnostic logs) whenever this page's own deepSearchStage
+      // mirror hadn't caught up yet. isGrounded (a label only) keeps the
+      // "done" check, since a not-yet-finished thread shouldn't claim to be
+      // grounding on its report.
+      const reportThreadId = threadId;
       const documentIds = documents.map((d) => d.document_id);
-      const isGrounded = mode === "chat" && (reportThreadId !== null || documentIds.length > 0);
+      const isGrounded = mode === "chat" && ((deepSearchStage === "done" && reportThreadId !== null) || documentIds.length > 0);
 
       setMessages((m) => [
         ...m,

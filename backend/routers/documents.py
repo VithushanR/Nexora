@@ -168,13 +168,14 @@ def _clean_id(value: Optional[str]) -> Optional[str]:
 async def _upload_limits(user_id: str) -> tuple[Optional[int], Optional[int]]:
     """Return (max_docs, max_size_mb) for the caller's account tier.
 
-    Either value is None when the tier sets no limit of its own. The getattr
-    defaults keep today's behaviour (no document cap, only the global
-    UPLOAD_MAX_SIZE_MB) until backend/tiers.py defines upload_max_docs /
-    upload_max_size_mb.
+    Either value is None when the tier sets no limit of its own. Direct
+    attribute access (not getattr with a fallback): TierLimits.upload_max_docs
+    / upload_max_size_mb are real fields now, so a typo or a removed field
+    would raise AttributeError here rather than silently reverting to
+    "unlimited" the way a getattr default would.
     """
     limits = get_tier_config(await get_user_tier(user_id))
-    return getattr(limits, "upload_max_docs", None), getattr(limits, "upload_max_size_mb", None)
+    return limits.upload_max_docs, limits.upload_max_size_mb
 
 
 def _tier_limit_error(limit: str, message: str) -> HTTPException:

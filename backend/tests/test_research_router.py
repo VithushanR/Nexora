@@ -688,6 +688,10 @@ def test_done_thread_without_report_returns_safe_server_error(router_environment
 
 
 def test_report_pdf_requires_done_status(router_environment):
+    # PDF export is plan-gated (see the TestPdfExportTierGating below); FREE
+    # (this fixture's default tier) has it disabled, which would otherwise
+    # produce a 403 before the status check this test is actually about.
+    router_environment.tier_lookup.return_value = TierName.PRO
     thread = _paused_thread(router_environment)
 
     with _client(router_environment) as client:
@@ -697,6 +701,7 @@ def test_report_pdf_requires_done_status(router_environment):
 
 
 def test_report_pdf_returns_downloadable_pdf_when_done(router_environment):
+    router_environment.tier_lookup.return_value = TierName.PRO
     thread = FakeThread("done-thread", "owner-1", "Test domain", "done")
     router_environment.threads[thread.thread_id] = thread
     router_environment.graph.interrupted = False
@@ -711,6 +716,58 @@ def test_report_pdf_returns_downloadable_pdf_when_done(router_environment):
     assert thread.thread_id in response.headers["content-disposition"]
     assert response.content.startswith(b"%PDF")
     router_environment.quota_creator.assert_not_awaited()
+
+
+class TestPdfExportTierGating:
+    def test_free_tier_pdf_export_is_blocked_with_upgrade_message(self, router_environment):
+        router_environment.tier_lookup.return_value = TierName.FREE
+        thread = FakeThread("done-thread", "owner-1", "Test domain", "done")
+        router_environment.threads[thread.thread_id] = thread
+        router_environment.graph.interrupted = False
+        router_environment.graph.report = "# Completed report\n\nSome findings."
+
+        with _client(router_environment) as client:
+            response = client.get(f"/research/{thread.thread_id}/report/pdf")
+
+        assert response.status_code == 403
+        detail = response.json()["detail"]
+        assert detail == {
+            "code": "tier_limit",
+            "limit": "pdf_export_enabled",
+            "message": (
+                "PDF export is available on Pro and Team plans -- upgrade to "
+                "download your report as a PDF. The Markdown report is still available."
+            ),
+        }
+        assert not response.content.startswith(b"%PDF")
+
+    @pytest.mark.parametrize("tier", [TierName.PRO, TierName.TEAM])
+    def test_pro_and_team_tier_pdf_export_succeeds(self, router_environment, tier):
+        router_environment.tier_lookup.return_value = tier
+        thread = FakeThread("done-thread", "owner-1", "Test domain", "done")
+        router_environment.threads[thread.thread_id] = thread
+        router_environment.graph.interrupted = False
+        router_environment.graph.report = "# Completed report\n\nSome findings."
+
+        with _client(router_environment) as client:
+            response = client.get(f"/research/{thread.thread_id}/report/pdf")
+
+        assert response.status_code == 200
+        assert response.content.startswith(b"%PDF")
+
+    def test_free_tier_can_still_get_the_markdown_report(self, router_environment):
+        """PDF export is blocked; the underlying report is not."""
+        router_environment.tier_lookup.return_value = TierName.FREE
+        thread = FakeThread("done-thread", "owner-1", "Test domain", "done")
+        router_environment.threads[thread.thread_id] = thread
+        router_environment.graph.interrupted = False
+        router_environment.graph.report = "# Completed report\n\nSome findings."
+
+        with _client(router_environment) as client:
+            response = client.get(f"/research/{thread.thread_id}/report")
+
+        assert response.status_code == 200
+        assert response.json() == {"report": "# Completed report\n\nSome findings."}
 
 
 def test_start_rate_limit_rejects_the_eleventh_request(router_environment):

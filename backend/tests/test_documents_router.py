@@ -33,6 +33,8 @@ import backend.routers.documents as documents_module
 from backend.auth.jwt import get_current_user
 from backend.documents_store import Document
 from backend.routers.documents import router
+from backend.tiers import TierName
+from backend.tiers import get_tier_config as real_get_tier_config
 
 
 class SessionClient(_BaseTestClient):
@@ -540,9 +542,14 @@ class TestDeletion:
 # ---------------------------------------------------------------------------
 
 # Fake tier limits, so these tests don't depend on the final numbers in
-# backend/tiers.py. NO_TIER_UPLOAD_LIMITS has none of the upload fields,
-# i.e. today's behaviour: no document cap, only the global size limit.
-NO_TIER_UPLOAD_LIMITS = SimpleNamespace()
+# backend/tiers.py. Each still declares upload_max_docs/upload_max_size_mb
+# explicitly (as None where unset) -- the real TierLimits always has these
+# fields now, and _upload_limits() reads them directly (no getattr
+# fallback), so a fake missing them entirely would fail with an
+# AttributeError that has nothing to do with what each test is checking.
+# NO_TIER_UPLOAD_LIMITS is today's "no tier limit configured" case: no
+# document cap, only the global size limit.
+NO_TIER_UPLOAD_LIMITS = SimpleNamespace(upload_max_docs=None, upload_max_size_mb=None)
 FREE_UPLOAD_LIMITS = SimpleNamespace(upload_max_docs=1, upload_max_size_mb=1)
 PRO_UPLOAD_LIMITS = SimpleNamespace(upload_max_docs=20, upload_max_size_mb=20)
 
@@ -631,6 +638,50 @@ class TestTierDocumentCap:
 
         assert _upload(SessionClient(_make_test_app()), session_id="s1").status_code == 201
         count.assert_not_awaited()
+
+
+class TestRealTierConfig:
+    """The tests above use fake tier limits deliberately decoupled from
+    backend/tiers.py's real numbers. These confirm the real, configured
+    FREE/PRO values actually drive this endpoint end to end -- not just
+    that the enforcement logic works against an arbitrary fake."""
+
+    def test_real_free_tier_second_upload_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(documents_module, "get_tier_config", real_get_tier_config)
+        monkeypatch.setattr(documents_module, "get_user_tier", AsyncMock(return_value=TierName.FREE))
+        client = SessionClient(_make_test_app())
+
+        assert _upload(client, session_id="s1").status_code == 201
+        response = _upload(client, session_id="s1")
+
+        assert response.status_code == 403
+        assert response.json()["detail"]["limit"] == "upload_max_docs"
+
+    def test_real_pro_tier_second_upload_succeeds(self, monkeypatch):
+        monkeypatch.setattr(documents_module, "get_tier_config", real_get_tier_config)
+        monkeypatch.setattr(documents_module, "get_user_tier", AsyncMock(return_value=TierName.PRO))
+        client = SessionClient(_make_test_app())
+
+        assert _upload(client, session_id="s1").status_code == 201
+        assert _upload(client, session_id="s1").status_code == 201
+
+    def test_real_free_tier_oversized_but_under_global_limit_is_rejected(self, monkeypatch):
+        """FREE's real upload_max_size_mb (5MB) is well under the global
+        UPLOAD_MAX_SIZE_MB default (20MB) -- a file in between the two must
+        be rejected as a plan limit, not silently allowed by the global cap."""
+        monkeypatch.setattr(documents_module, "get_tier_config", real_get_tier_config)
+        monkeypatch.setattr(documents_module, "get_user_tier", AsyncMock(return_value=TierName.FREE))
+        assert 5 < documents_module.UPLOAD_MAX_SIZE_MB
+        client = SessionClient(_make_test_app())
+
+        response = client.post(
+            "/documents/upload",
+            files={"file": ("big.pdf", _padded_pdf_bytes(6 * 1024 * 1024), "application/pdf")},
+            data={"session_id": "s1"},
+        )
+
+        assert response.status_code == 403
+        assert response.json()["detail"]["limit"] == "upload_max_size_mb"
 
 
 class TestTierSizeLimit:

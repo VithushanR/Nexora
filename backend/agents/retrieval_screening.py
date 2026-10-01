@@ -272,7 +272,12 @@ PAPER ABSTRACT:
         return {"verdict": "UNCERTAIN", "quote": "",
                 "reason": f"Model returned empty response (finish_reason={result.get('finish_reason')})."}
 
-    if _normalize(result.get("quote", "")) not in _normalize(abstract):
+    normalized_quote = _normalize(result.get("quote", ""))
+    # An empty string is trivially "in" any string in Python -- without this
+    # explicit check, a missing/blank quote would pass the substring test
+    # below by accident of string semantics, letting an unsupported verdict
+    # through as if it had been verified.
+    if not normalized_quote or normalized_quote not in _normalize(abstract):
         result["verdict"] = "UNCERTAIN"
         result["reason"] = (result.get("reason") or "") + " [quote could not be verified against abstract]"
 

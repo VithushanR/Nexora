@@ -103,14 +103,14 @@ EMBED_MODEL = "all-MiniLM-L6-v2"
 def tier_gap_limits(tier):
     """Return (max_papers, min_support) for an account tier.
 
-    max_papers is None when the tier mines every selected paper. The
-    getattr defaults keep today's behaviour (no cap, MIN_SUPPORT) until
-    backend/tiers.py defines gap_max_papers / gap_min_support.
+    max_papers is None when the tier mines every selected paper. Direct
+    attribute access (not getattr with a fallback): gap_max_papers and
+    gap_min_support are real TierLimits fields now, so a typo or a removed
+    field raises AttributeError here rather than silently reverting to "no
+    cap" the way a getattr default would.
     """
     limits = get_tier_config(tier)
-    max_papers = getattr(limits, "gap_max_papers", None)
-    min_support = getattr(limits, "gap_min_support", MIN_SUPPORT)
-    return max_papers, min_support
+    return limits.gap_max_papers, limits.gap_min_support
 
 
 # ============================================================
@@ -554,7 +554,12 @@ async def gap_discovery_node(state: ResearchState) -> dict:
         raise ValueError("gap_discovery_node requires state['tier'] to be set.")
     max_papers, min_support = tier_gap_limits(tier)
 
-    papers = state.get("selected_papers") or []
+    # Highest-relevance first, same key Agent 2's own sort_by_verdict uses --
+    # so a tier's cap keeps the papers most likely to matter, not an
+    # arbitrary subset in whatever order they happened to arrive in
+    # state["selected_papers"]. A stable sort: papers with no prerank_score
+    # (e.g. in tests that don't set one) keep their original relative order.
+    papers = sorted(state.get("selected_papers") or [], key=lambda p: p.get("prerank_score", 0.0) or 0.0, reverse=True)
 
     if not papers:
         return {
