@@ -87,6 +87,17 @@ Respond ONLY with valid JSON, no markdown fences:
 
 NOTHING_FOUND_REPLY = "I couldn't find anything relevant to that in the attached sources."
 
+# Three DISTINCT failure replies, not one generic string for everything --
+# budget exhaustion, a safety-filtered/empty generation, and "no usable
+# result at all" (unparseable JSON, or any other exception llm_json_call
+# already logged) are different problems with different causes, and used to
+# be indistinguishable to the user (and, since a None result was never
+# logged here at all, to anyone reading the logs afterward either).
+BUDGET_EXHAUSTED_REPLY = "Gemini's usage limit was reached. Please try again in a minute."
+BLOCKED_OR_EMPTY_REPLY = "I couldn't generate a response to that message -- it may have been filtered. Try rephrasing it."
+RETRIEVAL_FAILED_REPLY = "I ran into a problem looking through your sources just now. Please try again."
+TRUNCATED_REPLY = "I started generating an answer but it was cut off before finishing. Please try again."
+
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
@@ -133,8 +144,78 @@ class GroundingContext:
         return "[Report]" if self.kind == "report" else f"[Doc: {self.label}]"
 
 
-def _degraded(result: Optional[dict]) -> bool:
-    return result is None or bool(result.get("_budget_exhausted")) or bool(result.get("_blocked_or_empty"))
+FailureReason = Literal["no_response", "budget_exhausted", "blocked_or_empty", "retrieval_failed", "truncated"]
+
+
+def _failure_reason(result: Optional[dict]) -> Optional[FailureReason]:
+    """None means `result` is a usable payload. Otherwise, which of the
+    distinct ways the call failed -- see _reply_for_failure()."""
+    if result is None:
+        return "no_response"
+    if result.get("_budget_exhausted"):
+        return "budget_exhausted"
+    if result.get("_blocked_or_empty"):
+        return "blocked_or_empty"
+    if result.get("_truncated"):
+        return "truncated"
+    return None
+
+
+def _reply_for_failure(
+    reason: FailureReason, result: Optional[dict], *, debug_label: str, thread_id: Optional[str], message: str,
+    detail: str = "",
+) -> str:
+    """Logs the real cause -- llm_json_call/llm_web_search_call already log
+    the low-level exception or parse failure itself; this adds the
+    request-level context those calls don't have (which endpoint, which
+    thread, how long the message was) -- and returns a reply that's honest
+    about which of these problems it was, instead of one generic string for
+    all of them regardless of cause.
+
+    `retrieval_failed` is a different kind of failure from the other three:
+    it comes from an exception raised BEFORE any Gemini call is even made
+    (see _grounded_reply's retrieval step), not from something Gemini
+    returned -- `detail` carries that exception's repr() for the log line.
+    """
+    if reason == "retrieval_failed":
+        logger.error(
+            "%s degraded: retrieval raised %s (thread_id=%s, message_len=%d)",
+            debug_label, detail, thread_id, len(message),
+        )
+        return RETRIEVAL_FAILED_REPLY
+    if reason == "truncated":
+        # Distinct from "no_response": the model produced a real, complete-
+        # looking answer that simply ran out of token budget before its
+        # closing JSON -- the fix is to raise max_output_tokens, not to
+        # treat this as an unexplained failure (see llm_json_call's
+        # distinguish_truncation docstring).
+        logger.error(
+            "%s degraded: output truncated by max_output_tokens (raw_length=%s, thread_id=%s, message_len=%d) "
+            "-- consider raising max_output_tokens",
+            debug_label, (result or {}).get("raw_length"), thread_id, len(message),
+        )
+        return TRUNCATED_REPLY
+    if reason == "budget_exhausted":
+        logger.warning(
+            "%s degraded: Gemini budget/quota exhausted (thread_id=%s, message_len=%d)",
+            debug_label, thread_id, len(message),
+        )
+        return BUDGET_EXHAUSTED_REPLY
+    if reason == "blocked_or_empty":
+        logger.warning(
+            "%s degraded: empty/blocked response (finish_reason=%s, thread_id=%s, message_len=%d)",
+            debug_label, (result or {}).get("finish_reason"), thread_id, len(message),
+        )
+        return BLOCKED_OR_EMPTY_REPLY
+    # "no_response": unparseable JSON after retries, or an exception
+    # llm_json_call caught and logged itself -- previously this case wasn't
+    # logged here AT ALL (the old check was `if result is not None`), so a
+    # None result left zero trace of what actually happened.
+    logger.error(
+        "%s degraded: no usable LLM response (thread_id=%s, message_len=%d)",
+        debug_label, thread_id, len(message),
+    )
+    return FALLBACK_REPLY
 
 
 def _safe_label(title: str) -> str:
@@ -165,28 +246,43 @@ async def _resolve_contexts(
     return contexts
 
 
-async def _general_reply(message: str) -> ChatResponse:
+async def _general_reply(message: str, *, thread_id: Optional[str]) -> ChatResponse:
     # Short and cheap on purpose (see llm_json_call's max_output_tokens
     # docstring) -- this is a sentence or two of small talk, not report
     # synthesis, and shouldn't pay for 4096 tokens of headroom it will
     # never use.
     result = await llm_json_call(
         GENERAL_SYSTEM_PROMPT, message, debug_label="general_chat", max_output_tokens=200,
+        distinguish_truncation=True,
     )
-    reply = result.get("reply") if result and not _degraded(result) else None
+    reason = _failure_reason(result)
+    reply = result.get("reply") if reason is None and result is not None else None
     if not isinstance(reply, str) or not reply.strip():
-        if result is not None:
-            logger.warning("general chat degraded to fallback: %s", dict(result))
-        reply = FALLBACK_REPLY
+        reply = _reply_for_failure(
+            reason or "no_response", result, debug_label="general_chat", thread_id=thread_id, message=message,
+        )
     return ChatResponse(message_id=str(uuid.uuid4()), reply=reply.strip(), mode="general")
 
 
-async def _grounded_reply(message: str, contexts: list[GroundingContext]) -> ChatResponse:
+async def _grounded_reply(
+    message: str, contexts: list[GroundingContext], *, thread_id: Optional[str],
+) -> ChatResponse:
     # query() is a blocking embedding + FAISS call -- one thread per context,
-    # concurrently, off the event loop.
-    per_context = await asyncio.gather(
-        *(asyncio.to_thread(query, ctx.namespace, message, top_k=TOP_K_PER_CONTEXT) for ctx in contexts)
-    )
+    # concurrently, off the event loop. Wrapped explicitly: an exception here
+    # (e.g. a FAISS index mid-rebuild) happens BEFORE any Gemini call, so it
+    # would otherwise never go through _reply_for_failure at all -- it would
+    # propagate as an unhandled 500 instead of degrading like every other
+    # failure in this file does.
+    try:
+        per_context = await asyncio.gather(
+            *(asyncio.to_thread(query, ctx.namespace, message, top_k=TOP_K_PER_CONTEXT) for ctx in contexts)
+        )
+    except Exception as exc:
+        reply = _reply_for_failure(
+            "retrieval_failed", None, debug_label="grounded_chat_retrieval",
+            thread_id=thread_id, message=message, detail=repr(exc)[:200],
+        )
+        return ChatResponse(message_id=str(uuid.uuid4()), reply=reply, mode="grounded")
 
     # All namespaces share one embedding model, so their L2 distances are
     # directly comparable -- merge on it (lower = more similar).
@@ -203,13 +299,23 @@ async def _grounded_reply(message: str, contexts: list[GroundingContext]) -> Cha
         GROUNDED_SYSTEM_PROMPT,
         f"CONTEXT:\n{context_block}\n\nQUESTION: {message}",
         debug_label="grounded_chat",
-        max_output_tokens=1024,
+        # Doubled from the original 1024: a real production answer citing
+        # two sources (up to TOP_K_TOTAL=6 merged chunks) was observed
+        # truncated mid-sentence at 1024 -- thinking_config already sets
+        # thinking_budget=0 (see llm_json_call), so every one of these
+        # tokens goes to the visible answer, not reasoning. 2048 stays well
+        # under the 4096 pipeline-wide default while giving a multi-
+        # paragraph, multi-citation answer real headroom.
+        max_output_tokens=2048,
+        distinguish_truncation=True,
     )
-    answer = result.get("answer") if result and not _degraded(result) else None
+    reason = _failure_reason(result)
+    answer = result.get("answer") if reason is None and result is not None else None
     if not isinstance(answer, str) or not answer.strip():
-        if result is not None:
-            logger.warning("grounded chat degraded to fallback: %s", dict(result))
-        return ChatResponse(message_id=str(uuid.uuid4()), reply=FALLBACK_REPLY, mode="grounded")
+        reply = _reply_for_failure(
+            reason or "no_response", result, debug_label="grounded_chat", thread_id=thread_id, message=message,
+        )
+        return ChatResponse(message_id=str(uuid.uuid4()), reply=reply, mode="grounded")
 
     # Sources come from what was actually retrieved, not from what the model
     # says it used -- best match first, one entry per report/document.
@@ -222,17 +328,18 @@ async def _grounded_reply(message: str, contexts: list[GroundingContext]) -> Cha
     )
 
 
-async def _web_reply(message: str) -> ChatResponse:
+async def _web_reply(message: str, *, thread_id: Optional[str]) -> ChatResponse:
     result = await llm_web_search_call(message)
-    if result is None or _degraded(result):
-        if result is not None:
-            logger.warning("web search degraded to fallback: %s", dict(result))
-        return ChatResponse(message_id=str(uuid.uuid4()), reply=FALLBACK_REPLY, mode="web")
+    reason = _failure_reason(result)
+    if reason is not None:
+        reply = _reply_for_failure(reason, result, debug_label="web_search", thread_id=thread_id, message=message)
+        return ChatResponse(message_id=str(uuid.uuid4()), reply=reply, mode="web")
+    assert result is not None  # reason is None only when llm_web_search_call returned a real payload
     return ChatResponse(
         message_id=str(uuid.uuid4()),
         reply=result["text"],
         mode="web",
-        sources=[ChatSource(kind="web", label=s["title"], url=s["url"]) for s in result["sources"]],
+        sources=[ChatSource(kind="web", label=source["title"], url=source["url"]) for source in result["sources"]],
     )
 
 
@@ -283,11 +390,15 @@ async def chat(request: ChatRequest, user_id: str = Depends(get_current_user)) -
         await require_owned_thread(request.thread_id, user_id)
 
     if request.mode == "web":
-        response = await _web_reply(safe_message)
+        response = await _web_reply(safe_message, thread_id=request.thread_id)
         document_id = None  # web mode never looks at attached documents
     else:
         contexts = await _resolve_contexts(user_id, request.thread_id, request.document_ids)
-        response = await _grounded_reply(safe_message, contexts) if contexts else await _general_reply(safe_message)
+        response = (
+            await _grounded_reply(safe_message, contexts, thread_id=request.thread_id)
+            if contexts
+            else await _general_reply(safe_message, thread_id=request.thread_id)
+        )
         # The message row carries one document id; with several attached, the
         # sources on the reply say which were used.
         attached = list(dict.fromkeys(request.document_ids))

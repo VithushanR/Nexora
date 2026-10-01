@@ -29,7 +29,10 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 import backend.routers.chat as chat
-from backend.routers.chat import FALLBACK_REPLY, NOTHING_FOUND_REPLY, ChatRequest
+from backend.routers.chat import (
+    BLOCKED_OR_EMPTY_REPLY, BUDGET_EXHAUSTED_REPLY, FALLBACK_REPLY, NOTHING_FOUND_REPLY, RETRIEVAL_FAILED_REPLY,
+    TRUNCATED_REPLY, ChatRequest,
+)
 
 MODULE = "backend.routers.chat"
 
@@ -74,17 +77,40 @@ async def test_greeting_gets_the_models_real_reply():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "llm_result",
+    "llm_result,expected_reply,log_level",
     [
-        {"_budget_exhausted": True},
-        {"_blocked_or_empty": True, "finish_reason": "SAFETY"},
-        None,
-        {"unexpected_key": "value"},
+        ({"_budget_exhausted": True}, BUDGET_EXHAUSTED_REPLY, "WARNING"),
+        ({"_blocked_or_empty": True, "finish_reason": "SAFETY"}, BLOCKED_OR_EMPTY_REPLY, "WARNING"),
+        (None, FALLBACK_REPLY, "ERROR"),
+        ({"unexpected_key": "value"}, FALLBACK_REPLY, "ERROR"),
     ],
 )
-async def test_general_chat_degrades_to_fallback_not_crash(llm_result):
-    with patch(f"{MODULE}.llm_json_call", AsyncMock(return_value=llm_result)):
-        response = await chat.chat(ChatRequest(session_id="s1", message="hello"), user_id="u1")
+async def test_general_chat_gives_a_distinct_reply_and_logs_per_failure_mode(caplog, llm_result, expected_reply, log_level):
+    """The three ways an LLM call can fail must never collapse into one
+    unlabeled string -- and a None result must actually be logged (it used
+    to be silently swallowed), with enough to diagnose it: thread_id and
+    message length."""
+    with caplog.at_level("WARNING"):
+        with patch(f"{MODULE}.llm_json_call", AsyncMock(return_value=llm_result)):
+            response = await chat.chat(
+                ChatRequest(session_id="s1", message="hello", thread_id=None), user_id="u1"
+            )
+
+    assert response.reply == expected_reply
+    [record] = [r for r in caplog.records if r.name == "nexora.chat_router"]
+    assert record.levelname == log_level
+    assert "general_chat" in record.message
+    assert "message_len=5" in record.message  # len("hello")
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_but_parseable_reply_is_also_a_no_response_failure(caplog):
+    """{"unexpected_key": ...} is valid JSON but not the contract -- must be
+    treated (and logged) the same as a None result, not silently rendered
+    as an empty/garbage reply."""
+    with caplog.at_level("ERROR"):
+        with patch(f"{MODULE}.llm_json_call", AsyncMock(return_value={"unexpected_key": "value"})):
+            response = await chat.chat(ChatRequest(session_id="s1", message="hi"), user_id="u1")
 
     assert response.reply == FALLBACK_REPLY
 
@@ -149,12 +175,19 @@ async def test_web_mode_ignores_report_and_document_context_entirely():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("result", [None, {"_budget_exhausted": True}, {"_blocked_or_empty": True}])
-async def test_web_mode_degrades_to_fallback(result):
+@pytest.mark.parametrize(
+    "result,expected_reply",
+    [
+        (None, FALLBACK_REPLY),
+        ({"_budget_exhausted": True}, BUDGET_EXHAUSTED_REPLY),
+        ({"_blocked_or_empty": True}, BLOCKED_OR_EMPTY_REPLY),
+    ],
+)
+async def test_web_mode_gives_a_distinct_reply_per_failure_mode(result, expected_reply):
     with patch(f"{MODULE}.llm_web_search_call", AsyncMock(return_value=result)):
         response = await chat.chat(ChatRequest(session_id="s1", message="news", mode="web"), user_id="u1")
 
-    assert response.reply == FALLBACK_REPLY
+    assert response.reply == expected_reply
     assert response.mode == "web"
 
 
@@ -243,6 +276,28 @@ async def test_total_retrieval_is_capped_across_contexts():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("message", ["explain the doc briefly", "explain all of the doc"])
+async def test_the_cap_holds_regardless_of_how_broad_the_question_is(message):
+    """Rules out the "a broader question pulls in more merged context" theory
+    from the bug report directly: retrieval is capped by TOP_K_PER_CONTEXT/
+    TOP_K_TOTAL BEFORE the LLM call, and that cap doesn't depend on what the
+    question says -- 'explain briefly' and 'explain all of the doc' must
+    produce an identically-sized merged prompt, with a LARGE (thousands of
+    characters per chunk) result set from each source."""
+    huge_chunk = "x" * 5000
+    per_context = [{"text": huge_chunk, "score": float(i)} for i in range(chat.TOP_K_PER_CONTEXT)]
+    llm = AsyncMock(return_value={"answer": "ok"})
+    with patch(f"{MODULE}.require_owned_thread", AsyncMock()), patch(f"{MODULE}.get_thread", _done_thread()), \
+         patch(f"{MODULE}.get_owned_document_or_404", AsyncMock(return_value=_doc_row())), \
+         patch(f"{MODULE}.query", Mock(return_value=per_context)), patch(f"{MODULE}.llm_json_call", llm):
+        await chat.chat(ChatRequest(session_id="s1", message=message, thread_id="t1", document_ids=["d1"]), user_id="u1")
+
+    prompt = llm.call_args.args[1]
+    assert prompt.count("\n\n---\n\n") + 1 == chat.TOP_K_TOTAL
+    assert len(prompt) < 2 * chat.TOP_K_TOTAL * len(huge_chunk)  # never grows past the capped hit count
+
+
+@pytest.mark.asyncio
 async def test_grounded_with_no_retrieval_hits_says_so_without_calling_the_llm():
     llm = AsyncMock()
     with patch(f"{MODULE}.get_owned_document_or_404", AsyncMock(return_value=_doc_row())), \
@@ -255,15 +310,49 @@ async def test_grounded_with_no_retrieval_hits_says_so_without_calling_the_llm()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("result", [None, {"_budget_exhausted": True}, {"_blocked_or_empty": True}, {"nope": 1}])
-async def test_grounded_chat_degrades_to_fallback(result):
-    with patch(f"{MODULE}.get_owned_document_or_404", AsyncMock(return_value=_doc_row())), \
-         patch(f"{MODULE}.query", Mock(return_value=[{"text": "x", "score": 0.1}])), \
-         patch(f"{MODULE}.llm_json_call", AsyncMock(return_value=result)):
-        response = await chat.chat(ChatRequest(session_id="s1", message="q", document_ids=["d1"]), user_id="u1")
+@pytest.mark.parametrize(
+    "result,expected_reply",
+    [
+        (None, FALLBACK_REPLY),
+        ({"_budget_exhausted": True}, BUDGET_EXHAUSTED_REPLY),
+        ({"_blocked_or_empty": True}, BLOCKED_OR_EMPTY_REPLY),
+        ({"nope": 1}, FALLBACK_REPLY),
+    ],
+)
+async def test_grounded_chat_gives_a_distinct_reply_per_failure_mode(caplog, result, expected_reply):
+    """Reproduces the reported bug: a real thread with both a document and a
+    report, in the exact dual-context path, where the underlying LLM call
+    fails for one of three reasons -- each must produce its own honest
+    reply, and the thread_id from the request must reach the log line."""
+    with caplog.at_level("WARNING"):
+        with patch(f"{MODULE}.require_owned_thread", AsyncMock()), patch(f"{MODULE}.get_thread", _done_thread()), \
+             patch(f"{MODULE}.get_owned_document_or_404", AsyncMock(return_value=_doc_row())), \
+             patch(f"{MODULE}.query", Mock(return_value=[{"text": "x", "score": 0.1}])), \
+             patch(f"{MODULE}.llm_json_call", AsyncMock(return_value=result)):
+            response = await chat.chat(
+                ChatRequest(session_id="s1", message="explain all of the doc", thread_id="t1", document_ids=["d1"]),
+                user_id="u1",
+            )
 
-    assert response.reply == FALLBACK_REPLY
+    assert response.reply == expected_reply
     assert response.mode == "grounded"
+    if expected_reply != FALLBACK_REPLY or result is not None:
+        [record] = [r for r in caplog.records if r.name == "nexora.chat_router"]
+        assert "grounded_chat" in record.message and "thread_id=t1" in record.message
+
+
+@pytest.mark.asyncio
+async def test_a_none_result_is_logged_even_though_it_used_to_be_silent(caplog):
+    """The exact gap the bug report called out: result is None (llm_json_call
+    already logs the low-level exception itself) used to produce NO log line
+    at all here, because the old check was `if result is not None`."""
+    with caplog.at_level("ERROR"):
+        with patch(f"{MODULE}.get_owned_document_or_404", AsyncMock(return_value=_doc_row())), \
+             patch(f"{MODULE}.query", Mock(return_value=[{"text": "x", "score": 0.1}])), \
+             patch(f"{MODULE}.llm_json_call", AsyncMock(return_value=None)):
+            await chat.chat(ChatRequest(session_id="s1", message="q", document_ids=["d1"]), user_id="u1")
+
+    assert any(r.name == "nexora.chat_router" and r.levelname == "ERROR" for r in caplog.records)
 
 
 # ------------------------------------------------------------------
@@ -491,3 +580,185 @@ async def test_history_for_a_thread_checks_ownership(monkeypatch):
             await chat.chat_history(session_id=None, thread_id="t1", user_id="intruder")
 
     assert exc_info.value.status_code == 404
+
+
+# ------------------------------------------------------------------
+# Exact reproduction of the reported bug: the two exact messages, a thread
+# with BOTH a document and a report attached, through all three call sites,
+# for all three llm_json_call/llm_web_search_call failure sentinels.
+# ------------------------------------------------------------------
+
+REPORTED_MESSAGES = ["explain the doc briefly", "explain all of the doc"]
+MOCKED_RESULTS = [
+    ({"_budget_exhausted": True}, BUDGET_EXHAUSTED_REPLY, "WARNING"),
+    ({"_blocked_or_empty": True, "finish_reason": "SAFETY"}, BLOCKED_OR_EMPTY_REPLY, "WARNING"),
+    (None, FALLBACK_REPLY, "ERROR"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", REPORTED_MESSAGES)
+@pytest.mark.parametrize("mocked_result,expected_reply,log_level", MOCKED_RESULTS)
+async def test_general_reply_reported_messages_all_three_failure_modes(caplog, message, mocked_result, expected_reply, log_level):
+    """_general_reply direct-called with the exact reported message text, for
+    each of a/b/c. (chat()'s own routing can never reach _general_reply when
+    a report+document are attached -- contexts would be non-empty -- so this
+    calls the function directly, same as the routing does internally.)"""
+    with caplog.at_level("WARNING"):
+        with patch(f"{MODULE}.llm_json_call", AsyncMock(return_value=mocked_result)):
+            response = await chat._general_reply(message, thread_id="t1")
+
+    assert response.reply == expected_reply
+    [record] = [r for r in caplog.records if r.name == "nexora.chat_router"]
+    assert record.levelname == log_level
+    assert f"message_len={len(message)}" in record.message and "thread_id=t1" in record.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", REPORTED_MESSAGES)
+@pytest.mark.parametrize("mocked_result,expected_reply,log_level", MOCKED_RESULTS)
+async def test_grounded_reply_reported_messages_all_three_failure_modes_with_doc_and_report(
+    caplog, message, mocked_result, expected_reply, log_level,
+):
+    """The exact reported scenario: a thread with BOTH a document and a
+    completed report attached, sent through the real chat() endpoint (not
+    just the bare function), for each of a/b/c."""
+    with caplog.at_level("WARNING"):
+        with patch(f"{MODULE}.require_owned_thread", AsyncMock()), patch(f"{MODULE}.get_thread", _done_thread()), \
+             patch(f"{MODULE}.get_owned_document_or_404", AsyncMock(return_value=_doc_row())), \
+             patch(f"{MODULE}.query", Mock(return_value=[{"text": "some retrieved chunk", "score": 0.1}])), \
+             patch(f"{MODULE}.llm_json_call", AsyncMock(return_value=mocked_result)):
+            response = await chat.chat(
+                ChatRequest(session_id="s1", message=message, thread_id="t1", document_ids=["d1"]), user_id="u1",
+            )
+
+    assert response.reply == expected_reply
+    assert response.mode == "grounded"
+    [record] = [r for r in caplog.records if r.name == "nexora.chat_router"]
+    assert record.levelname == log_level
+    assert "grounded_chat" in record.message
+    assert f"message_len={len(message)}" in record.message and "thread_id=t1" in record.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", REPORTED_MESSAGES)
+@pytest.mark.parametrize("mocked_result,expected_reply,log_level", MOCKED_RESULTS)
+async def test_web_reply_reported_messages_all_three_failure_modes(caplog, message, mocked_result, expected_reply, log_level):
+    """_web_reply direct-called with the exact reported message text, for
+    each of a/b/c. (Web mode ignores thread/document context by design, so
+    this confirms the failure handling, not the ignoring -- that's covered
+    by test_web_mode_ignores_report_and_document_context_entirely.)"""
+    with caplog.at_level("WARNING"):
+        with patch(f"{MODULE}.llm_web_search_call", AsyncMock(return_value=mocked_result)):
+            response = await chat._web_reply(message, thread_id="t1")
+
+    assert response.reply == expected_reply
+    [record] = [r for r in caplog.records if r.name == "nexora.chat_router"]
+    assert record.levelname == log_level
+    assert f"message_len={len(message)}" in record.message and "thread_id=t1" in record.message
+
+
+# ------------------------------------------------------------------
+# Step 2: a fourth path -- an exception raised in the RETRIEVAL step itself
+# (before any Gemini call), not something llm_json_call/llm_web_search_call
+# returned. Must degrade the same honest way, not crash with a 500 and not
+# silently reuse FALLBACK_REPLY for an unrelated cause.
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_an_exception_during_retrieval_degrades_honestly_not_a_500(caplog):
+    with caplog.at_level("ERROR"):
+        with patch(f"{MODULE}.require_owned_thread", AsyncMock()), patch(f"{MODULE}.get_thread", _done_thread()), \
+             patch(f"{MODULE}.get_owned_document_or_404", AsyncMock(return_value=_doc_row())), \
+             patch(f"{MODULE}.query", Mock(side_effect=IndexError("list index out of range"))), \
+             patch(f"{MODULE}.llm_json_call", AsyncMock()) as llm:
+            response = await chat.chat(
+                ChatRequest(session_id="s1", message="explain all of the doc", thread_id="t1", document_ids=["d1"]),
+                user_id="u1",
+            )
+
+    assert response.reply == RETRIEVAL_FAILED_REPLY
+    assert response.mode == "grounded"
+    llm.assert_not_called()  # never reached the Gemini call at all
+    [record] = [r for r in caplog.records if r.name == "nexora.chat_router"]
+    assert record.levelname == "ERROR"
+    assert "IndexError" in record.message and "thread_id=t1" in record.message and "message_len=" in record.message
+
+
+@pytest.mark.asyncio
+async def test_a_document_ownership_404_during_retrieval_is_not_swallowed():
+    """The retrieval_failed catch must not accidentally turn a REAL 404 (an
+    unowned/deleted document) into a friendly chat reply -- that check runs
+    in _resolve_contexts, outside the try/except this fix added."""
+    with patch(f"{MODULE}.get_owned_document_or_404", AsyncMock(side_effect=HTTPException(status_code=404))):
+        with pytest.raises(HTTPException) as exc_info:
+            await chat.chat(ChatRequest(session_id="s1", message="q", document_ids=["gone"]), user_id="u1")
+
+    assert exc_info.value.status_code == 404
+
+
+# ------------------------------------------------------------------
+# MAX_TOKENS truncation: the real production bug -- a complete, correctly
+# grounded answer citing both a document and a report, cut off mid-sentence
+# by max_output_tokens. Must be a distinct case, not the generic fallback,
+# and must carry the real thread_id in the log line.
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_grounded_reply_truncated_output_is_a_distinct_case_not_generic_fallback(caplog):
+    """Reproduces the exact reported failure: {"_truncated": True, ...} from
+    llm_json_call (not None, not budget-exhausted, not blocked) must produce
+    TRUNCATED_REPLY, not FALLBACK_REPLY, logged at ERROR with the real cause
+    and a hint to raise max_output_tokens."""
+    truncated_result = {"_truncated": True, "raw_length": 612}
+    with caplog.at_level("ERROR"):
+        with patch(f"{MODULE}.require_owned_thread", AsyncMock()), patch(f"{MODULE}.get_thread", _done_thread()),              patch(f"{MODULE}.get_owned_document_or_404", AsyncMock(return_value=_doc_row())),              patch(f"{MODULE}.query", Mock(return_value=[{"text": "some retrieved chunk", "score": 0.1}])),              patch(f"{MODULE}.llm_json_call", AsyncMock(return_value=truncated_result)) as llm:
+            response = await chat.chat(
+                ChatRequest(session_id="s1", message="explain all of the doc", thread_id="t1", document_ids=["d1"]),
+                user_id="u1",
+            )
+
+    assert response.reply == TRUNCATED_REPLY
+    assert response.reply not in (FALLBACK_REPLY, BUDGET_EXHAUSTED_REPLY, BLOCKED_OR_EMPTY_REPLY)
+    assert response.mode == "grounded"
+    # The raised headroom + opt-in, confirmed at the call site.
+    assert llm.call_args.kwargs["max_output_tokens"] == 2048
+    assert llm.call_args.kwargs["distinguish_truncation"] is True
+    [record] = [r for r in caplog.records if r.name == "nexora.chat_router"]
+    assert record.levelname == "ERROR"
+    assert "truncat" in record.message.lower()
+    assert "raw_length=612" in record.message
+    assert "thread_id=t1" in record.message and "message_len=" in record.message
+    assert "raising max_output_tokens" in record.message
+
+
+@pytest.mark.asyncio
+async def test_general_chat_also_opts_into_truncation_detection():
+    with patch(f"{MODULE}.llm_json_call", AsyncMock(return_value={"reply": "hi"})) as llm:
+        await chat.chat(ChatRequest(session_id="s1", message="hello"), user_id="u1")
+
+    assert llm.call_args.kwargs["distinguish_truncation"] is True
+
+
+@pytest.mark.asyncio
+async def test_thread_id_reaches_the_log_line_for_a_real_document_and_report_chat(caplog):
+    """The exact gap from the bug report: thread_id=None appeared in the log
+    for what was supposed to be a document+report chat. Confirms the real
+    thread_id from the request reaches the log line when both a finished
+    report AND a document are genuinely attached -- the backend side of the
+    propagation chain (request.thread_id -> chat() -> _grounded_reply ->
+    _reply_for_failure) is exercised end to end, exactly as a real request
+    would use it."""
+    with caplog.at_level("ERROR"):
+        with patch(f"{MODULE}.require_owned_thread", AsyncMock()), patch(f"{MODULE}.get_thread", _done_thread("thread-abc-123")),              patch(f"{MODULE}.get_owned_document_or_404", AsyncMock(return_value=_doc_row())),              patch(f"{MODULE}.query", Mock(return_value=[{"text": "chunk", "score": 0.1}])),              patch(f"{MODULE}.llm_json_call", AsyncMock(return_value=None)):
+            await chat.chat(
+                ChatRequest(
+                    session_id="s1", message="explain the doc briefly",
+                    thread_id="thread-abc-123", document_ids=["d1"],
+                ),
+                user_id="u1",
+            )
+
+    [record] = [r for r in caplog.records if r.name == "nexora.chat_router"]
+    assert "thread_id=thread-abc-123" in record.message
+    assert "thread_id=None" not in record.message

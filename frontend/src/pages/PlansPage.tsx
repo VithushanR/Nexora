@@ -51,7 +51,6 @@ const PLANS: Plan[] = [
     features: [
       "Complete open-access full-text cascade",
       "Live web search in Copilot",
-      "Writing assistant",
       "Expanded document uploads",
       "Branded PDF report export",
       "20 contradiction pairs per review",

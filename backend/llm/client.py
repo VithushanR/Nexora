@@ -103,15 +103,30 @@ def reset_budget_flag_for_tests():
 
 async def llm_json_call(system_prompt: str, user_prompt: str, *,
                          retries: int = 1, debug_label: str = "",
-                         max_output_tokens: int = 4096) -> Optional[dict]:
+                         max_output_tokens: int = 4096,
+                         distinguish_truncation: bool = False) -> Optional[dict]:
     """
     Returns:
       - a parsed dict on success
-      - None if the model's output could not be parsed after retries
+      - None if the model's output could not be parsed after retries (this
+        includes a truncated response, UNLESS distinguish_truncation=True --
+        see below)
       - {"_budget_exhausted": True} if quota/credits are exhausted
       - {"_blocked_or_empty": True, "finish_reason": ...} if the model
         returned nothing (commonly a safety-filter false-positive on
         clinical/academic text -- see SAFETY_SETTINGS above)
+      - {"_truncated": True, "raw_length": ...} -- ONLY when
+        distinguish_truncation=True -- if the response was cut off by
+        max_output_tokens before it finished (finish_reason=MAX_TOKENS). A
+        genuinely different problem from a plain parse failure: the answer
+        itself was fine, there just wasn't enough token budget for it, and
+        the fix is to raise max_output_tokens, not to treat it as an
+        unexplained failure. This is opt-in and additive rather than the
+        default behavior for every caller of this shared function: existing
+        pipeline stages (screening, gap discovery, contradiction detection,
+        report assembly, protocol planning) all check `result is None` or
+        `not result` and would NOT handle a truthy-but-incomplete dict here
+        safely -- see routers/chat.py for the one caller that does opt in.
 
     Callers MUST check for these sentinels and degrade honestly (e.g.
     escalate a screening verdict to UNCERTAIN) rather than treating a
@@ -188,10 +203,18 @@ async def llm_json_call(system_prompt: str, user_prompt: str, *,
         try:
             return json.loads(raw)
         except Exception:
+            truncated = bool(finish_reason and "MAX_TOKENS" in str(finish_reason).upper())
             if attempt == retries:
-                truncated = finish_reason and "MAX_TOKENS" in str(finish_reason).upper()
                 hint = " [MAX_TOKENS truncation]" if truncated else ""
                 logger.error("JSON parse failed for [%s]%s. Raw: %r", debug_label, hint, raw[:1000])
+                # A truncated-but-otherwise-well-formed answer is a distinct,
+                # actionable failure (raise max_output_tokens) -- not the same
+                # "no signal at all" case as a genuinely unparseable response,
+                # so it gets its own sentinel instead of collapsing to None
+                # (callers previously had no way to tell these apart; see
+                # routers/chat.py's FailureReason).
+                if truncated and distinguish_truncation:
+                    return {"_truncated": True, "raw_length": len(raw)}
                 return None
             await asyncio.sleep(1)
 

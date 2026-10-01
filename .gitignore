@@ -7,3 +7,6 @@ node_modules/
 dist/
 backend/uploads/*
 !backend/uploads/.gitkeep
+
+backend/rag/index_store/*.faiss
+backend/rag/index_store/*.chunks.pkl

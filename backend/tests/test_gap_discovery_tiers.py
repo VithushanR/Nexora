@@ -21,6 +21,8 @@ import pytest
 
 from backend.agents import gap_discovery
 from backend.agents.gap_discovery import MIN_SUPPORT, gap_discovery_node, tier_gap_limits
+from backend.tiers import TIER_CONFIG, TierName
+from backend.tiers import get_tier_config as real_get_tier_config
 
 
 FREE_LIMITS = SimpleNamespace(gap_max_papers=3, gap_min_support=2)
@@ -29,6 +31,13 @@ PRO_LIMITS = SimpleNamespace(gap_max_papers=None, gap_min_support=2)
 
 def make_papers(n):
     return [{"title": f"Paper {i}", "abstract": "abstract"} for i in range(1, n + 1)]
+
+
+def make_ranked_papers(n):
+    """Papers with DESCENDING titles but ASCENDING prerank_score -- i.e.
+    arrival order is the opposite of relevance order, so a test using this
+    can tell "capped by position" apart from "capped by relevance"."""
+    return [{"title": f"Paper {n - i}", "prerank_score": float(i), "abstract": "abstract"} for i in range(n)]
 
 
 @pytest.fixture
@@ -120,7 +129,87 @@ async def test_missing_tier_fails_loud(mined):
         await gap_discovery_node({"selected_papers": make_papers(2)})  # type: ignore[typeddict-item]
 
 
-def test_tier_without_gap_fields_keeps_current_behaviour(monkeypatch):
+def test_tier_missing_gap_fields_entirely_fails_loudly_not_silently_uncapped(monkeypatch):
+    """gap_max_papers/gap_min_support are read via direct attribute access,
+    not getattr(..., default) -- a tier object that doesn't define them (a
+    bug elsewhere, not a real account tier) must surface as a clear error
+    rather than silently mining every paper with no cap, which is exactly
+    what the old getattr default did before backend/tiers.py defined these
+    fields for real."""
     use_limits(monkeypatch, SimpleNamespace(candidate_cap=50, concurrency=5))
 
-    assert tier_gap_limits("free") == (None, MIN_SUPPORT)
+    with pytest.raises(AttributeError, match="gap_max_papers"):
+        tier_gap_limits("free")
+
+
+# ---------------------------------------------------------------------------
+# Capped papers must be the highest-relevance ones, not an arbitrary subset
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cap_keeps_the_highest_prerank_score_papers_not_arrival_order(monkeypatch, mined):
+    use_limits(monkeypatch, FREE_LIMITS)  # gap_max_papers=3
+    # Arrival order is the REVERSE of relevance order (see make_ranked_papers).
+    papers = make_ranked_papers(5)
+    highest_score_titles = {p["title"] for p in sorted(papers, key=lambda p: p["prerank_score"], reverse=True)[:3]}
+
+    await gap_discovery_node({"tier": "free", "selected_papers": papers})  # type: ignore[typeddict-item]
+
+    assert {p["title"] for p in mined["papers"]} == highest_score_titles
+    assert mined["papers"] != papers[:3]  # would be a bug: that's arrival order, not relevance order
+
+
+@pytest.mark.asyncio
+async def test_capped_papers_are_sorted_highest_score_first(monkeypatch, mined):
+    use_limits(monkeypatch, FREE_LIMITS)  # gap_max_papers=3
+    papers = make_ranked_papers(5)
+
+    await gap_discovery_node({"tier": "free", "selected_papers": papers})  # type: ignore[typeddict-item]
+
+    scores = [p["prerank_score"] for p in mined["papers"]]
+    assert scores == sorted(scores, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Real backend.tiers.py values, end to end (the fixtures above use fakes
+# deliberately decoupled from the real numbers)
+# ---------------------------------------------------------------------------
+
+class TestRealTierConfig:
+    @pytest.mark.asyncio
+    async def test_real_free_tier_caps_at_10_papers(self, monkeypatch, mined):
+        monkeypatch.setattr(gap_discovery, "get_tier_config", real_get_tier_config)
+        papers = make_papers(15)
+
+        result = await gap_discovery_node({"tier": TierName.FREE, "selected_papers": papers})  # type: ignore[typeddict-item]
+
+        assert len(mined["papers"]) == 10
+        assert "first 10 of 15 selected papers" in result["gaps_status"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_real_pro_tier_caps_at_50_papers(self, monkeypatch, mined):
+        monkeypatch.setattr(gap_discovery, "get_tier_config", real_get_tier_config)
+        papers = make_papers(60)
+
+        result = await gap_discovery_node({"tier": TierName.PRO, "selected_papers": papers})  # type: ignore[typeddict-item]
+
+        assert len(mined["papers"]) == 50
+        assert "first 50 of 60 selected papers" in result["gaps_status"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_real_team_tier_analyzes_every_selected_paper(self, monkeypatch, mined):
+        monkeypatch.setattr(gap_discovery, "get_tier_config", real_get_tier_config)
+        papers = make_papers(60)
+
+        result = await gap_discovery_node({"tier": TierName.TEAM, "selected_papers": papers})  # type: ignore[typeddict-item]
+
+        assert len(mined["papers"]) == 60
+        assert "upgrade" not in result["gaps_status"]["message"]
+
+    def test_gap_min_support_is_identical_across_every_tier(self):
+        """Fails if anyone changes one tier's gap_min_support without the
+        others -- gap_min_support must mean the same thing on every plan,
+        unlike gap_max_papers, which is deliberately tier-scaled."""
+        values = {tier: TIER_CONFIG[tier].gap_min_support for tier in TierName}
+        assert len(set(values.values())) == 1, values
+        assert real_get_tier_config(TierName.FREE).gap_min_support == MIN_SUPPORT

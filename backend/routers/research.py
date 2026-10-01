@@ -387,10 +387,12 @@ async def research_report_pdf(thread_id: str, user_id: str = Depends(get_current
     """
     from backend.agents.report_assembly import render_pdf
 
-    # getattr default keeps today's behaviour (PDF for every tier) until
-    # backend/tiers.py defines pdf_export_enabled.
+    # Direct attribute access, not getattr with a fallback: pdf_export_enabled
+    # is a real TierLimits field now, so a typo or a removed field would
+    # raise AttributeError here rather than silently reverting to "enabled
+    # for everyone" the way a getattr default would.
     limits = get_tier_config(await get_user_tier(user_id))
-    if not getattr(limits, "pdf_export_enabled", True):
+    if not limits.pdf_export_enabled:
         # TODO: switch to the shared tier-rejection helper once backend/tiers.py
         # defines it, so every tier limit returns one shape.
         raise HTTPException(

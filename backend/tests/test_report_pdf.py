@@ -83,10 +83,13 @@ No contradictions detected.
 # ---------------------------------------------------------------------------
 
 # Fake tier limits, so these tests don't depend on the final values in
-# backend/tiers.py. NO_PDF_FIELD has no pdf_export_enabled, i.e. today's
-# behaviour: every tier can export.
+# backend/tiers.py.
 PDF_DISABLED = SimpleNamespace(pdf_export_enabled=False)
 PDF_ENABLED = SimpleNamespace(pdf_export_enabled=True)
+# A tier object with no pdf_export_enabled at all -- the real TierLimits
+# always has this field now, and the endpoint reads it directly (no getattr
+# fallback), so this simulates a malformed/incomplete tier object rather
+# than "today's behaviour."
 NO_PDF_FIELD = SimpleNamespace()
 
 
@@ -149,13 +152,17 @@ def test_pdf_export_enabled_tier_gets_the_pdf(pdf_endpoint):
     pdf_endpoint.load_report.assert_awaited_once_with("thread-1", "user_alice")
 
 
-def test_tier_without_pdf_field_keeps_current_behaviour(pdf_endpoint):
+def test_tier_missing_the_pdf_field_entirely_fails_loudly_not_silently_allowed(pdf_endpoint):
+    """pdf_export_enabled is read via direct attribute access, not
+    getattr(..., True) -- a tier object that doesn't define it (a bug
+    elsewhere, not a real account tier) must surface as a clear error
+    rather than silently granting PDF export to everyone, which is exactly
+    what the old getattr default did before backend/tiers.py defined this
+    field for real."""
     pdf_endpoint.use_limits(NO_PDF_FIELD)
 
-    response = pdf_endpoint.client.get("/research/thread-1/report/pdf")
-
-    assert response.status_code == 200
-    assert response.content.startswith(b"%PDF")
+    with pytest.raises(AttributeError, match="pdf_export_enabled"):
+        pdf_endpoint.client.get("/research/thread-1/report/pdf")
 
 
 def test_pdf_gate_uses_the_requesting_users_tier(pdf_endpoint):
