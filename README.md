@@ -191,12 +191,7 @@ All four agents, the human-selection checkpoint, report assembly, authentication
 - [x] Authentication (Google Sign-In + JWT)
 - [x] PostgreSQL persistence (reports, documents, chat history, checkpoints)
 - [x] Subscription tiers (Free / Pro / Team) with server-side enforcement
-- [ ] Rate limiting on document/Copilot-indexing endpoints
-- [ ] Tier gate on Web Search mode
-- [ ] Unicode-normalized prompt sanitization
-- [ ] Sanitization applied to externally retrieved paper content
-- [ ] **Roadmap:** structural credibility scoring (study design, sample size, venue)
-- [ ] **Roadmap:** dataset-feasibility check on candidate gaps
+
 
 ## Contributing
 
